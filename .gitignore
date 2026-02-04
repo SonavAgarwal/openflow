@@ -1,0 +1,5 @@
+.build
+.build/*
+transcriber/build
+transcriber/build/*
+transcriber/whisper.cpp/models/ggml-silero-v5.1.2.bin

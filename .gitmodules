@@ -1,0 +1,3 @@
+[submodule "transcriber/whisper.cpp"]
+	path = transcriber/whisper.cpp
+	url = https://github.com/ggml-org/whisper.cpp
