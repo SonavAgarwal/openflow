@@ -67,11 +67,10 @@ Example:
 }
 ```
 
-LLM refinement uses OpenRouter. The app will prompt for an API key on first run and store it in
-`~/.config/openflow/config.json`. For development you can also provide:
+LLM refinement uses OpenRouter. Provide an API key in config or via env:
 
 - `OPENROUTER_API_KEY` environment variable
-- `apiKey` in `~/.config/openflow/config.json`
+- `apiKey` in `~/.openflow/config.json`
 
 Optional dictionary file (used to bias decoding + prompt for VAD/Whisper):
 
@@ -112,12 +111,37 @@ VAD thresholds are configurable:
 }
 ```
 
+Styles are configurable. If omitted, defaults are created on first run.
+
+```json
+{
+  "styles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "systemPrompt": "Determine the intended style to the best of your ability. Use proper punctuation and capitalization and respect the original style."
+    },
+    {
+      "id": "casual",
+      "name": "Casual",
+      "systemPrompt": "Use a casual, friendly tone. Contractions are fine. Keep it natural."
+    },
+    {
+      "id": "formal",
+      "name": "Formal",
+      "systemPrompt": "Use a formal, professional tone. Avoid contractions. Keep it polished."
+    }
+  ],
+  "selectedStyleId": "casual"
+}
+```
+
 ## History
 
 History file is stored at:
 
 ```
-~/.config/openflow/history.jsonl
+~/.openflow/history.jsonl
 ```
 
 Each line is a JSON object. You can append items via:

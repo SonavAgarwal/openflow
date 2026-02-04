@@ -15,6 +15,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private let llmRefiner = LLMRefiner()
     private var levelTimer: Timer?
     private var didRequestMic = false
+    private let styleStore = StyleStore()
+    private var styleWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -36,6 +38,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         transcriptionRunner.beamSize = configStore.config.beamSize
         transcriptionRunner.vadStart = configStore.config.vadStart
         transcriptionRunner.vadStop = configStore.config.vadStop
+        styleStore.load(from: configStore.config)
+        llmRefiner.styleStore = styleStore
         llmRefiner.apiKey = resolveApiKey()
         if let key = llmRefiner.apiKey {
             print("[openrouter] apiKey: \(KeyMasker.mask(key))")
@@ -63,6 +67,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        let stylesMenu = NSMenu(title: "Styles")
+        let stylesItem = NSMenuItem(title: "Styles", action: nil, keyEquivalent: "")
+        stylesItem.submenu = stylesMenu
+        menu.addItem(stylesItem)
+        rebuildStylesMenu(stylesMenu)
+
+        menu.addItem(NSMenuItem.separator())
+
         let historyMenu = NSMenu(title: "History")
         let historyItem = NSMenuItem(title: "History", action: nil, keyEquivalent: "")
         historyItem.submenu = historyMenu
@@ -77,6 +89,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
         item.menu = menu
         statusItem = item
+        updateStatusIcon()
     }
 
     private func setupHotkey() {
@@ -100,6 +113,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             return
         }
         bubbleState.isListening = true
+        updateStatusIcon()
         do {
             try transcriptionRunner.startStreaming()
             try audioRecorder.startStreaming { [weak self] pcm in
@@ -108,6 +122,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             startLevelMeter()
         } catch {
             bubbleState.isListening = false
+            updateStatusIcon()
             return
         }
     }
@@ -115,6 +130,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private func stopListening() {
         guard bubbleState.isListening else { return }
         bubbleState.isListening = false
+        updateStatusIcon()
         stopLevelMeter()
         audioRecorder.stopStreaming()
         let refiner = llmRefiner
@@ -152,6 +168,61 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         if let menu = statusItem?.menu?.item(withTitle: "History")?.submenu {
             rebuildHistoryMenu(menu)
         }
+    }
+
+    private func refreshStylesMenu() {
+        if let menu = statusItem?.menu?.item(withTitle: "Styles")?.submenu {
+            rebuildStylesMenu(menu)
+        }
+    }
+
+    private func rebuildStylesMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for style in styleStore.styles {
+            let item = NSMenuItem(title: style.name, action: #selector(selectStyle(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (style.id == styleStore.selectedStyleId) ? .on : .off
+            item.representedObject = style
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let manageItem = NSMenuItem(title: "Manage Styles...", action: #selector(manageStyles), keyEquivalent: "")
+        manageItem.target = self
+        menu.addItem(manageItem)
+    }
+
+    @objc private func selectStyle(_ sender: NSMenuItem) {
+        guard let style = sender.representedObject as? StyleDefinition else { return }
+        styleStore.selectedStyleId = style.id
+        configStore.saveStyles(styleStore.styles, selectedId: style.id)
+        refreshStylesMenu()
+    }
+
+    @objc private func manageStyles() {
+        if let window = styleWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            return
+        }
+        let view = StylesManagerView(store: styleStore) { [weak self] in
+            guard let self else { return }
+            self.configStore.saveStyles(self.styleStore.styles, selectedId: self.styleStore.selectedStyleId)
+            self.refreshStylesMenu()
+        }
+        let hosting = NSHostingView(rootView: view)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
+                              styleMask: [.titled, .closable, .resizable],
+                              backing: .buffered,
+                              defer: false)
+        window.title = "Manage Styles"
+        window.contentView = hosting
+        window.center()
+        window.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        styleWindow = window
     }
 
     private func rebuildHistoryMenu(_ menu: NSMenu) {
@@ -204,6 +275,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     @objc private func reloadHistory() {
         historyStore.load()
         refreshHistoryMenu()
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem?.button else { return }
+        button.title = bubbleState.isListening ? "●" : "OF"
     }
 
     @objc private func copyHistoryItem(_ sender: NSMenuItem) {
@@ -343,6 +419,114 @@ struct BubbleView: View {
         )
         .animation(.spring(response: 0.2, dampingFraction: 0.9), value: state.isListening)
         .foregroundStyle(.white)
+    }
+}
+
+struct StylesManagerView: View {
+    @ObservedObject var store: StyleStore
+    var onSave: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("Pick a style for the LLM to apply after transcription. You can edit or add your own.")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(store.styles) { style in
+                                Button {
+                                    store.selectedStyleId = style.id
+                                    onSave()
+                                } label: {
+                                    Text(style.name)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.vertical, 6)
+                                        .padding(.horizontal, 8)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .fill(style.id == store.selectedStyleId ? Color.accentColor.opacity(0.35) : Color.clear)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minWidth: 170, maxWidth: 220, maxHeight: .infinity)
+                    .padding(6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.gray.opacity(0.12))
+                    )
+
+                    Button("Add Style") {
+                        _ = store.addStyle()
+                        onSave()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    if let index = selectedIndex {
+                        Text("Style name")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("Name", text: nameBinding(index))
+                            .textFieldStyle(.roundedBorder)
+                        Text("Style description")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextEditor(text: promptBinding(index))
+                            .font(.system(size: 12))
+                            .frame(minHeight: 180)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.gray.opacity(0.3))
+                            )
+                        Button("Delete Style") {
+                            store.deleteSelected()
+                            onSave()
+                        }
+                        .disabled(store.styles.count <= 1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text("Select a style to edit.")
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+                }
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 520, minHeight: 360)
+        .onAppear { onSave() }
+        .onChange(of: store.styles) { _ in onSave() }
+        .onChange(of: store.selectedStyleId) { _ in onSave() }
+        .onDisappear { onSave() }
+    }
+
+    private var selectedIndex: Int? {
+        guard let id = store.selectedStyleId else { return nil }
+        return store.styles.firstIndex { $0.id == id }
+    }
+
+    private func nameBinding(_ index: Int) -> Binding<String> {
+        Binding(
+            get: { store.styles[index].name },
+            set: { store.styles[index].name = $0 }
+        )
+    }
+
+    private func promptBinding(_ index: Int) -> Binding<String> {
+        Binding(
+            get: { store.styles[index].systemPrompt },
+            set: { store.styles[index].systemPrompt = $0 }
+        )
     }
 }
 
@@ -900,6 +1084,82 @@ final class HistoryStore {
     }
 }
 
+struct StyleDefinition: Identifiable, Codable, Hashable {
+    var id: String
+    var name: String
+    var systemPrompt: String
+}
+
+final class StyleStore: ObservableObject {
+    @Published var styles: [StyleDefinition] = []
+    @Published var selectedStyleId: String?
+
+    var selectedStyle: StyleDefinition? {
+        guard let selectedStyleId else { return styles.first }
+        return styles.first { $0.id == selectedStyleId } ?? styles.first
+    }
+
+    func load(from config: Config) {
+        if let stored = config.styles, !stored.isEmpty {
+            styles = stored
+        } else {
+            styles = Self.defaultStyles()
+        }
+        let selected = config.selectedStyleId
+        if let selected, styles.contains(where: { $0.id == selected }) {
+            selectedStyleId = selected
+        } else {
+            selectedStyleId = styles.first?.id
+        }
+    }
+
+    func addStyle() -> StyleDefinition {
+        let name = nextCustomName()
+        let style = StyleDefinition(id: UUID().uuidString, name: name, systemPrompt: "")
+        styles.append(style)
+        selectedStyleId = style.id
+        return style
+    }
+
+    func deleteSelected() {
+        guard let selectedStyleId else { return }
+        styles.removeAll { $0.id == selectedStyleId }
+        if styles.isEmpty {
+            styles = Self.defaultStyles()
+        }
+        self.selectedStyleId = styles.first?.id
+    }
+
+    private func nextCustomName() -> String {
+        let base = "Custom"
+        let existing = Set(styles.map { $0.name })
+        if !existing.contains(base) { return base }
+        var i = 2
+        while existing.contains("\(base) \(i)") { i += 1 }
+        return "\(base) \(i)"
+    }
+
+    static func defaultStyles() -> [StyleDefinition] {
+        return [
+            StyleDefinition(
+                id: "default",
+                name: "Default",
+                systemPrompt: "Determine the intended style to the best of your ability. Use proper punctuation and capitalization and respect the original style."
+            ),
+            StyleDefinition(
+                id: "casual",
+                name: "Casual",
+                systemPrompt: "Use a casual, friendly tone. Contractions are fine. Keep it natural."
+            ),
+            StyleDefinition(
+                id: "formal",
+                name: "Formal",
+                systemPrompt: "Use a formal, professional tone. Avoid contractions. Keep it polished."
+            )
+        ]
+    }
+}
+
 struct Config: Codable {
     var apiKey: String?
     var dictionaryPath: String?
@@ -909,6 +1169,8 @@ struct Config: Codable {
     var beamSize: Int?
     var vadStart: Double?
     var vadStop: Double?
+    var styles: [StyleDefinition]?
+    var selectedStyleId: String?
 }
 
 final class ConfigStore {
@@ -940,6 +1202,18 @@ final class ConfigStore {
         config.apiKey = key
         if let data = try? JSONEncoder().encode(config) {
             try? data.write(to: url)
+        }
+    }
+
+    func saveStyles(_ styles: [StyleDefinition], selectedId: String?) {
+        guard let url = Paths.configURL else { return }
+        Paths.ensureConfigDir()
+        var config = self.config
+        config.styles = styles
+        config.selectedStyleId = selectedId
+        if let data = try? JSONEncoder().encode(config) {
+            try? data.write(to: url)
+            self.config = config
         }
     }
 }
@@ -1033,6 +1307,7 @@ enum AccessibilityPaster {
 
 final class LLMRefiner: @unchecked Sendable {
     var apiKey: String?
+    var styleStore: StyleStore?
     private let client = OpenRouterClient()
 
     func refine(text: String, completion: @escaping @Sendable (String) -> Void) {
@@ -1040,7 +1315,8 @@ final class LLMRefiner: @unchecked Sendable {
             completion(text)
             return
         }
-        client.refine(text: text, apiKey: apiKey) { result in
+        let styleGuide = styleStore?.selectedStyle?.systemPrompt
+        client.refine(text: text, apiKey: apiKey, styleGuide: styleGuide) { result in
             completion(result ?? text)
         }
     }
@@ -1049,13 +1325,55 @@ final class LLMRefiner: @unchecked Sendable {
 final class OpenRouterClient {
     private let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 
-    func refine(text: String, apiKey: String, completion: @escaping @Sendable (String?) -> Void) {
+    func refine(text: String, apiKey: String, styleGuide: String?, completion: @escaping @Sendable (String?) -> Void) {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("https://openflow.local", forHTTPHeaderField: "HTTP-Referer")
         request.setValue("OpenFlow", forHTTPHeaderField: "X-Title")
+
+        let systemPrompt = buildSystemPrompt(styleGuide: styleGuide)
+
+        let payload: [String: Any] = [
+            "model": "openai/gpt-oss-120b",
+            "temperature": 0.05,
+            "reasoning": [
+                "effort": "low"
+            ],
+            "provider": [
+                "order": ["groq"],
+                "allow_fallbacks": false
+            ],
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": text]
+            ]
+        ]
+
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            completion(nil)
+            return
+        }
+        request.httpBody = body
+
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            guard let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = obj["choices"] as? [[String: Any]],
+                  let message = choices.first?["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                completion(nil)
+                return
+            }
+            completion(content)
+        }.resume()
+    }
+
+    private func buildSystemPrompt(styleGuide: String?) -> String {
+        let guide = (styleGuide?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? styleGuide!
+            : "Neutral, clear, friendly."
 
         let systemPrompt = """
 You are a dictation-to-text finisher and rewriter.
@@ -1116,42 +1434,9 @@ SAFETY/CONTENT EDGE CASES
 
 THIS IS NOT A CONVERSATION. DO NOT REPLY TO THE USER. ONLY RESPOND WITH THE REWRITTEN TEXT.
 
-FORMALITY LEVEL: casual texting, contractions allowed, lowercase, lax punctuation (e.g., no final punctuation unless needed)
+STYLE GUIDE: \(guide)
 """
-
-        let payload: [String: Any] = [
-            "model": "openai/gpt-oss-120b",
-            "temperature": 0.05,
-            "reasoning": [
-                "effort": "low"
-            ],
-            "provider": [
-                "order": ["groq"],
-                "allow_fallbacks": false
-            ],
-            "messages": [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": text]
-            ]
-        ]
-
-        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
-            completion(nil)
-            return
-        }
-        request.httpBody = body
-
-        URLSession.shared.dataTask(with: request) { data, response, _ in
-            guard let data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = obj["choices"] as? [[String: Any]],
-                  let message = choices.first?["message"] as? [String: Any],
-                  let content = message["content"] as? String else {
-                completion(nil)
-                return
-            }
-            completion(content)
-        }.resume()
+        return systemPrompt
     }
 }
 
