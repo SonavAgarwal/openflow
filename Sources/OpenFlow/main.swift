@@ -40,6 +40,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         transcriptionRunner.vadStop = configStore.config.vadStop
         styleStore.load(from: configStore.config)
         llmRefiner.styleStore = styleStore
+        if resolveApiKey() == nil {
+            promptForApiKeyIfNeeded()
+        }
         llmRefiner.apiKey = resolveApiKey()
         if let key = llmRefiner.apiKey {
             print("[openrouter] apiKey: \(KeyMasker.mask(key))")
@@ -323,6 +326,25 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func requestMicrophoneIfNeeded() {
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
+    }
+
+    private func promptForApiKeyIfNeeded() {
+        if configStore.config.didPromptForApiKey == true {
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Enter OpenRouter API Key"
+        alert.informativeText = "Optional: used for LLM refinement. You can set it later in ~/.openflow/config.json or OPENROUTER_API_KEY."
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Skip")
+        let response = alert.runModal()
+        let trimmed = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if response == .alertFirstButtonReturn, !trimmed.isEmpty {
+            configStore.setApiKey(trimmed)
+        }
+        configStore.markApiKeyPrompted()
     }
 
     private func resolveApiKey() -> String? {
@@ -1162,6 +1184,7 @@ final class StyleStore: ObservableObject {
 
 struct Config: Codable {
     var apiKey: String?
+    var didPromptForApiKey: Bool?
     var dictionaryPath: String?
     var dictionaryText: [String]?
     var model: String?
@@ -1205,12 +1228,33 @@ final class ConfigStore {
         }
     }
 
+    func setApiKey(_ key: String) {
+        var updated = config
+        updated.apiKey = key
+        writeConfig(updated)
+    }
+
+    func markApiKeyPrompted() {
+        var updated = config
+        updated.didPromptForApiKey = true
+        writeConfig(updated)
+    }
+
     func saveStyles(_ styles: [StyleDefinition], selectedId: String?) {
         guard let url = Paths.configURL else { return }
         Paths.ensureConfigDir()
         var config = self.config
         config.styles = styles
         config.selectedStyleId = selectedId
+        if let data = try? JSONEncoder().encode(config) {
+            try? data.write(to: url)
+            self.config = config
+        }
+    }
+
+    private func writeConfig(_ config: Config) {
+        guard let url = Paths.configURL else { return }
+        Paths.ensureConfigDir()
         if let data = try? JSONEncoder().encode(config) {
             try? data.write(to: url)
             self.config = config
