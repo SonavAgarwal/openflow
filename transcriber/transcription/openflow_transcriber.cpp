@@ -52,6 +52,7 @@ struct vad_params {
     bool use_gpu_whisper = true;
     bool debug = false;
     bool stdin_audio = false;
+    bool stdin_pcm = false;
 
     int32_t step_ms = 200;
     float start_threshold = 0.60f;
@@ -102,6 +103,7 @@ void print_usage(char **argv, const vad_params &p) {
     fprintf(stderr, "  --no-vad-events            do not emit per-chunk VAD probability packets\n");
     fprintf(stderr, "  --cpu-only                 disable GPU backends for whisper + VAD\n");
     fprintf(stderr, "  --stdin-audio              read WAV file paths from stdin (one per line) and keep model warm\n");
+    fprintf(stderr, "  --stdin-pcm                read float32 PCM from stdin (framed) and keep model warm\n");
     fprintf(stderr, "  -d, --debug                enable debug logging\n");
 }
 
@@ -178,6 +180,8 @@ bool parse_args(int argc, char **argv, vad_params &p) {
             p.emit_vad_events = false;
         } else if (a == "--stdin-audio") {
             p.stdin_audio = true;
+        } else if (a == "--stdin-pcm") {
+            p.stdin_pcm = true;
         } else if (a == "--start-threshold") {
             p.start_threshold = std::clamp(static_cast<float>(atof(need(a.c_str(), i))), 0.0f, 1.0f);
         } else if (a == "--stop-threshold") {
@@ -841,7 +845,8 @@ int main(int argc, char **argv) {
     const size_t max_segment_samples = static_cast<size_t>(std::max<int64_t>(static_cast<int64_t>(sample_rate), (int64_t)params.max_segment_ms * sample_rate / 1000));
 
     const bool use_stdin_audio = params.stdin_audio;
-    const bool use_mic_capture = params.audio_file.empty() && !use_stdin_audio;
+    const bool use_stdin_pcm = params.stdin_pcm;
+    const bool use_mic_capture = params.audio_file.empty() && !use_stdin_audio && !use_stdin_pcm;
     audio_async audio(std::max(params.ring_buffer_ms, params.max_segment_ms + params.post_padding_ms + 2000));
     if (use_mic_capture) {
         if (!audio.init(params.capture_id, sample_rate)) {
@@ -1547,6 +1552,54 @@ int main(int argc, char **argv) {
 
             printf("{\"event\":\"job_end\",\"path\":\"%s\"}\n", escape_json(line).c_str());
             fflush(stdout);
+        }
+    } else if (use_stdin_pcm) {
+        auto reset_state_and_emit = [&]() {
+            reset_segment_state();
+        };
+
+        auto read_exact = [&](void *dst, size_t n) -> bool {
+            return fread(dst, 1, n, stdin) == n;
+        };
+
+        while (true) {
+            uint8_t tag = 0;
+            if (!read_exact(&tag, 1)) {
+                break;
+            }
+            if (tag == 'Q') {
+                break;
+            }
+            if (tag == 'B') {
+                reset_state_and_emit();
+                printf("{\"event\":\"job_start\"}\n");
+                fflush(stdout);
+                continue;
+            }
+            if (tag == 'E') {
+                flush_segment(true);
+                printf("{\"event\":\"job_end\"}\n");
+                fflush(stdout);
+                continue;
+            }
+            if (tag == 'J') {
+                uint32_t n = 0;
+                if (!read_exact(&n, sizeof(uint32_t))) {
+                    break;
+                }
+                if (n == 0) {
+                    continue;
+                }
+                std::vector<float> samples(n);
+                if (!read_exact(samples.data(), n * sizeof(float))) {
+                    break;
+                }
+                for (float s : samples) {
+                    pending_samples.push_back(s);
+                }
+                process_pending_chunks();
+                continue;
+            }
         }
     } else {
         std::vector<float> offline_pcm;
