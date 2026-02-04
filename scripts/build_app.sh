@@ -21,7 +21,7 @@ echo "==> Building Swift app (release)"
 cd "${ROOT_DIR}"
 swift build -c release
 
-if [ ! -x "${TRANSCRIBER_BUILD_BIN}/vad_transcriber" ]; then
+if [ ! -x "${TRANSCRIBER_BUILD_BIN}/openflow_transcriber" ]; then
   echo "==> Building transcriber + VAD"
   cd "${TRANSCRIBER_DIR}"
   ./scripts/setup_whisper.sh
@@ -81,7 +81,7 @@ chmod +x "${MACOS_DIR}/${APP_NAME}"
 # Bundle transcriber binaries + models
 mkdir -p "${RESOURCES_DIR}/transcriber/build/bin"
 mkdir -p "${RESOURCES_DIR}/transcriber/whisper.cpp/models"
-cp "${TRANSCRIBER_BUILD_BIN}/vad_transcriber" "${RESOURCES_DIR}/transcriber/build/bin/"
+cp "${TRANSCRIBER_BUILD_BIN}/openflow_transcriber" "${RESOURCES_DIR}/transcriber/build/bin/"
 cp "${TRANSCRIBER_BUILD_BIN}/transcriber" "${RESOURCES_DIR}/transcriber/build/bin/"
 cp "${SMALL_MODEL}" "${RESOURCES_DIR}/transcriber/whisper.cpp/models/"
 cp "${SILERO_MODEL}" "${RESOURCES_DIR}/transcriber/whisper.cpp/models/"

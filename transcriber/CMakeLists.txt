@@ -49,22 +49,22 @@ set_target_properties(transcriber PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-add_executable(vad_transcriber
-  transcription/vad.cpp
+add_executable(openflow_transcriber
+  transcription/openflow_transcriber.cpp
   transcription/common-sdl.cpp
 )
 
-target_include_directories(vad_transcriber PRIVATE
+target_include_directories(openflow_transcriber PRIVATE
   whisper.cpp
   ${SDL2_INCLUDE_DIRS}
   transcription
 )
 
-target_link_libraries(vad_transcriber PRIVATE
+target_link_libraries(openflow_transcriber PRIVATE
   whisper
   ${SDL2_LIBRARIES}
 )
 
-set_target_properties(vad_transcriber PROPERTIES
+set_target_properties(openflow_transcriber PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

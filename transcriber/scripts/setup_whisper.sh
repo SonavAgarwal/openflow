@@ -89,7 +89,7 @@ CMAKE_ARGS=(
 
 cmake -S "${TRANSCRIBER_DIR}" -B "${BUILD_DIR}" \
   "${CMAKE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --target transcriber vad_transcriber -j
+cmake --build "${BUILD_DIR}" --target transcriber openflow_transcriber -j
 
 echo
 echo "✅ Setup complete!"

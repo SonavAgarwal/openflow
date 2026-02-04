@@ -41,14 +41,14 @@ This will:
 - initialize/update the `transcriber/whisper.cpp` submodule
 - apply the ARM NEON patch
 - download `base.en` + `small.en` models
-- build `transcriber` and `vad_transcriber`
+- build `transcriber` and `openflow_transcriber`
 - download `ggml-silero-v5.1.2.bin` for VAD
 
 Binary paths:
 
 ```
 transcriber/build/bin/transcriber
-transcriber/build/bin/vad_transcriber
+transcriber/build/bin/openflow_transcriber
 ```
 
 ## Config

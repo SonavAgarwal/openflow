@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -50,6 +51,7 @@ struct vad_params {
     bool emit_vad_events = true;
     bool use_gpu_whisper = true;
     bool debug = false;
+    bool stdin_audio = false;
 
     int32_t step_ms = 200;
     float start_threshold = 0.60f;
@@ -99,6 +101,7 @@ void print_usage(char **argv, const vad_params &p) {
     fprintf(stderr, "  --no-log                   disable verbose logging (default)\n");
     fprintf(stderr, "  --no-vad-events            do not emit per-chunk VAD probability packets\n");
     fprintf(stderr, "  --cpu-only                 disable GPU backends for whisper + VAD\n");
+    fprintf(stderr, "  --stdin-audio              read WAV file paths from stdin (one per line) and keep model warm\n");
     fprintf(stderr, "  -d, --debug                enable debug logging\n");
 }
 
@@ -173,6 +176,8 @@ bool parse_args(int argc, char **argv, vad_params &p) {
             p.log = false;
         } else if (a == "--no-vad-events" || a == "--no_vad_events") {
             p.emit_vad_events = false;
+        } else if (a == "--stdin-audio") {
+            p.stdin_audio = true;
         } else if (a == "--start-threshold") {
             p.start_threshold = std::clamp(static_cast<float>(atof(need(a.c_str(), i))), 0.0f, 1.0f);
         } else if (a == "--stop-threshold") {
@@ -835,7 +840,8 @@ int main(int argc, char **argv) {
     const size_t min_segment_samples = static_cast<size_t>(std::max<int64_t>(0, (int64_t)params.min_segment_ms * sample_rate / 1000));
     const size_t max_segment_samples = static_cast<size_t>(std::max<int64_t>(static_cast<int64_t>(sample_rate), (int64_t)params.max_segment_ms * sample_rate / 1000));
 
-    const bool use_mic_capture = params.audio_file.empty();
+    const bool use_stdin_audio = params.stdin_audio;
+    const bool use_mic_capture = params.audio_file.empty() && !use_stdin_audio;
     audio_async audio(std::max(params.ring_buffer_ms, params.max_segment_ms + params.post_padding_ms + 2000));
     if (use_mic_capture) {
         if (!audio.init(params.capture_id, sample_rate)) {
@@ -939,24 +945,23 @@ int main(int argc, char **argv) {
 
     const int fetch_window_ms = std::min<int>(params.ring_buffer_ms, params.max_segment_ms + params.post_padding_ms + 2000);
 
-    std::vector<float> offline_pcm;
-    if (!use_mic_capture) {
-        int sr_in = 0;
-        if (!read_wav_mono_f32(params.audio_file, offline_pcm, sr_in)) {
-            whisper_free(ctx);
-            return 1;
-        }
-        if (sr_in != sample_rate) {
-            offline_pcm = resample_linear(offline_pcm, sr_in, sample_rate);
-        }
-        if (params.debug) {
-            fprintf(stderr,
-                    "offline audio: '%s' -> %zu samples @ %d Hz\n",
-                    params.audio_file.c_str(),
-                    offline_pcm.size(),
-                    sample_rate);
-        }
-    }
+    auto reset_segment_state = [&]() {
+        pending_samples.clear();
+        pre_roll.clear();
+        chunk_buffer.clear();
+        current_segment.clear();
+        segment_prob_sum = 0.0;
+        segment_prob_count = 0;
+        in_segment = false;
+        segment_start_sample = 0;
+        last_voice_sample = 0;
+        processed_samples_total = 0;
+        last_fetch_time_ms = 0;
+        segment_index = 0;
+        active_segment_index = -1;
+        partial_sequence = 0;
+        last_partial_emit_sample = 0;
+    };
 
     std::string dictionary_cache;
     std::vector<std::vector<whisper_token>> dictionary_token_seqs;
@@ -1504,7 +1509,62 @@ int main(int argc, char **argv) {
 
         flush_segment(true);
         audio.pause();
+    } else if (use_stdin_audio) {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            if (line == "__quit__") {
+                break;
+            }
+
+            reset_segment_state();
+
+            std::vector<float> offline_pcm;
+            int sr_in = 0;
+            if (!read_wav_mono_f32(line, offline_pcm, sr_in)) {
+                fprintf(stderr, "error: failed to open audio file '%s'\n", line.c_str());
+                continue;
+            }
+            if (sr_in != sample_rate) {
+                offline_pcm = resample_linear(offline_pcm, sr_in, sample_rate);
+            }
+
+            printf("{\"event\":\"job_start\",\"path\":\"%s\"}\n", escape_json(line).c_str());
+            fflush(stdout);
+
+            for (float s : offline_pcm) {
+                pending_samples.push_back(s);
+            }
+            const size_t rem = pending_samples.size() % vad_chunk_samples;
+            if (rem) {
+                const size_t pad = vad_chunk_samples - rem;
+                for (size_t i = 0; i < pad; ++i) pending_samples.push_back(0.0f);
+            }
+            process_pending_chunks();
+            flush_segment(true);
+
+            printf("{\"event\":\"job_end\",\"path\":\"%s\"}\n", escape_json(line).c_str());
+            fflush(stdout);
+        }
     } else {
+        std::vector<float> offline_pcm;
+        int sr_in = 0;
+        if (!read_wav_mono_f32(params.audio_file, offline_pcm, sr_in)) {
+            whisper_free(ctx);
+            return 1;
+        }
+        if (sr_in != sample_rate) {
+            offline_pcm = resample_linear(offline_pcm, sr_in, sample_rate);
+        }
+        if (params.debug) {
+            fprintf(stderr,
+                    "offline audio: '%s' -> %zu samples @ %d Hz\n",
+                    params.audio_file.c_str(),
+                    offline_pcm.size(),
+                    sample_rate);
+        }
         for (float s : offline_pcm) {
             pending_samples.push_back(s);
         }
