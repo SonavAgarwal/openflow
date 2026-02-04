@@ -14,5 +14,6 @@ fi
 mkdir -p "${TARGET_DIR}"
 rm -rf "${TARGET_DIR}/${APP_NAME}.app"
 cp -R "${APP_DIR}" "${TARGET_DIR}/"
+rm -rf "${APP_DIR}"
 
 echo "✅ Installed to ${TARGET_DIR}/${APP_NAME}.app"

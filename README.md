@@ -103,6 +103,15 @@ You can embed the dictionary in `config.json`:
 }
 ```
 
+VAD thresholds are configurable:
+
+```json
+{
+  "vadStart": 0.2,
+  "vadStop": 0.1
+}
+```
+
 ## History
 
 History file is stored at:

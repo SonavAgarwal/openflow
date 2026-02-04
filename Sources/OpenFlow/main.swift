@@ -14,6 +14,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private let transcriptionRunner = TranscriptionRunner()
     private let llmRefiner = LLMRefiner()
     private var levelTimer: Timer?
+    private var didRequestMic = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -26,7 +27,6 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         }
 
         requestAccessibilityIfNeeded()
-        requestMicrophoneIfNeeded()
 
         configStore.load()
         transcriptionRunner.dictionaryPath = configStore.config.dictionaryPath
@@ -34,6 +34,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         transcriptionRunner.modelName = configStore.config.model
         transcriptionRunner.threads = configStore.config.threads
         transcriptionRunner.beamSize = configStore.config.beamSize
+        transcriptionRunner.vadStart = configStore.config.vadStart
+        transcriptionRunner.vadStop = configStore.config.vadStop
         llmRefiner.apiKey = resolveApiKey()
         if let key = llmRefiner.apiKey {
             print("[openrouter] apiKey: \(KeyMasker.mask(key))")
@@ -89,6 +91,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func startListening() {
         guard !bubbleState.isListening else { return }
+        if !didRequestMic {
+            didRequestMic = true
+            requestMicrophoneIfNeeded()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self.startListening()
+            }
+            return
+        }
         bubbleState.isListening = true
         do {
             try transcriptionRunner.startStreaming()
@@ -227,6 +237,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     }
 
     private func requestAccessibilityIfNeeded() {
+        if AXIsProcessTrusted() {
+            return
+        }
         let key = "AXTrustedCheckOptionPrompt" as CFString
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
@@ -472,6 +485,8 @@ final class TranscriptionRunner: @unchecked Sendable {
     var modelName: String?
     var threads: Int?
     var beamSize: Int?
+    var vadStart: Double?
+    var vadStop: Double?
     private var persistent: PersistentTranscriber?
     private var streaming = false
     private var pendingCompletion: (@Sendable (String) -> Void)?
@@ -639,12 +654,16 @@ final class TranscriptionRunner: @unchecked Sendable {
     }
 
     private func baseArgs(modelPath: URL, sileroPath: URL) -> [String] {
-        [
+        var args: [String] = [
             "--silero-vad", sileroPath.path,
             "--model", modelPath.path,
             "--pre-padding-ms", "400",
             "--post-padding-ms", "300"
         ]
+        let start = vadStart ?? 0.2
+        let stop = vadStop ?? 0.1
+        args += ["--start-threshold", "\(start)", "--stop-threshold", "\(stop)"]
+        return args
     }
 
     private static func extractTranscript(from data: Data) -> String {
@@ -888,6 +907,8 @@ struct Config: Codable {
     var model: String?
     var threads: Int?
     var beamSize: Int?
+    var vadStart: Double?
+    var vadStop: Double?
 }
 
 final class ConfigStore {
