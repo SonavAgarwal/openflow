@@ -17,6 +17,15 @@ swift build
 swift run
 ```
 
+## Build a .app bundle (for distribution)
+
+```bash
+./scripts/build_app.sh
+./scripts/install_app.sh
+```
+
+This creates `dist/OpenFlow.app` and installs it to `~/Applications/OpenFlow.app`.
+
 ## Whisper setup (C++ transcriber + VAD)
 
 This repo includes a `transcriber/` folder with a CMake build for the C++ transcriber
@@ -47,7 +56,7 @@ transcriber/build/bin/vad_transcriber
 Config file is read from:
 
 ```
-~/.config/openflow/config.json
+~/.openflow/config.json
 ```
 
 Example:
@@ -58,10 +67,16 @@ Example:
 }
 ```
 
+LLM refinement uses OpenRouter. The app will prompt for an API key on first run and store it in
+`~/.config/openflow/config.json`. For development you can also provide:
+
+- `OPENROUTER_API_KEY` environment variable
+- `apiKey` in `~/.config/openflow/config.json`
+
 Optional dictionary file (used to bias decoding + prompt for VAD/Whisper):
 
 ```
-~/.config/openflow/dictionary.txt
+~/.openflow/dictionary.txt
 ```
 
 You can override the dictionary path in `config.json`:
@@ -69,6 +84,22 @@ You can override the dictionary path in `config.json`:
 ```json
 {
   "dictionaryPath": "/absolute/path/to/dictionary.txt"
+}
+```
+
+You can select the whisper model in `config.json` (defaults to `small`):
+
+```json
+{
+  "model": "small"
+}
+```
+
+You can embed the dictionary in `config.json`:
+
+```json
+{
+  "dictionaryText": ["openai", "openflow", "whisper"]
 }
 ```
 

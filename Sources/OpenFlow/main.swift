@@ -12,6 +12,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private let hotkeyMonitor = HotkeyMonitor()
     private let audioRecorder = AudioRecorder()
     private let transcriptionRunner = TranscriptionRunner()
+    private let llmRefiner = LLMRefiner()
     private var levelTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -29,6 +30,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
         configStore.load()
         transcriptionRunner.dictionaryPath = configStore.config.dictionaryPath
+        transcriptionRunner.dictionaryText = configStore.config.dictionaryText
+        transcriptionRunner.modelName = configStore.config.model
+        llmRefiner.apiKey = resolveApiKey()
         historyStore.load()
         setupStatusItem()
         setupHotkey()
@@ -98,9 +102,13 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            self.historyStore.append(text: trimmed)
-            self.refreshHistoryMenu()
-            AccessibilityPaster.paste(trimmed)
+            print("[transcription] heard: \(trimmed)")
+            llmRefiner.refine(text: trimmed) { refined in
+                let finalText = refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : refined
+                self.historyStore.append(text: finalText)
+                self.refreshHistoryMenu()
+                AccessibilityPaster.paste(finalText)
+            }
         }
     }
 
@@ -177,7 +185,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                bubbleState.level = audioRecorder.currentLevel()
+                let level = audioRecorder.currentLevel()
+                bubbleState.level = level
+                bubbleState.pushLevel(level)
             }
         }
     }
@@ -186,6 +196,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         levelTimer?.invalidate()
         levelTimer = nil
         bubbleState.level = 0
+        bubbleState.levelHistory = Array(repeating: 0, count: 12)
     }
 
     private func requestAccessibilityIfNeeded() {
@@ -196,6 +207,16 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func requestMicrophoneIfNeeded() {
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
+    }
+
+    private func resolveApiKey() -> String? {
+        if let key = configStore.config.apiKey, !key.isEmpty {
+            return key
+        }
+        if let key = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"], !key.isEmpty {
+            return key
+        }
+        return nil
     }
 }
 
@@ -241,6 +262,19 @@ final class BubbleWindow: NSPanel {
 final class BubbleState: ObservableObject {
     @Published var isListening = false
     @Published var level: Double = 0
+    @Published var levelHistory: [Double] = Array(repeating: 0, count: 12)
+
+    func pushLevel(_ value: Double) {
+        var next = levelHistory
+        if next.isEmpty {
+            next = Array(repeating: 0, count: 12)
+        }
+        next.append(value)
+        if next.count > 12 {
+            next.removeFirst(next.count - 12)
+        }
+        levelHistory = next
+    }
 }
 
 struct BubbleView: View {
@@ -255,7 +289,7 @@ struct BubbleView: View {
                         .frame(width: 8, height: 8)
                     Text("Listening")
                         .font(.system(size: 12, weight: .medium))
-                    LevelBarGraph(level: state.level)
+                    LevelBarGraph(levels: state.levelHistory)
                         .frame(width: 42, height: 10)
                 }
                 .padding(.horizontal, 12)
@@ -351,20 +385,22 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
     func currentLevel() -> Double {
         guard let recorder else { return 0 }
         recorder.updateMeters()
-        let db = Double(recorder.averagePower(forChannel: 0))
-        let linear = pow(10.0, db / 20.0)
-        return min(1.0, max(0.0, linear))
+        let db = Double(recorder.peakPower(forChannel: 0))
+        if db.isNaN { return 0 }
+        // Map -60dB...0dB into 0...1
+        let normalized = (db + 60.0) / 60.0
+        return min(1.0, max(0.0, normalized))
     }
 }
 
 struct LevelBarGraph: View {
-    let level: Double
-    private let scales: [Double] = [0.4, 0.55, 0.7, 0.9, 1.0, 0.8, 0.6, 0.75, 1.0, 0.7, 0.5, 0.4]
+    let levels: [Double]
 
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(0..<scales.count, id: \.self) { idx in
-                let height = max(2, level * scales[idx] * 10)
+            ForEach(0..<levels.count, id: \.self) { idx in
+                let level = levels[idx]
+                let height = max(2, level * 10)
                 RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                     .fill(Color.white.opacity(0.9))
                     .frame(width: 2, height: height)
@@ -377,6 +413,8 @@ struct LevelBarGraph: View {
 final class TranscriptionRunner {
     private let queue = DispatchQueue(label: "openflow.transcription", qos: .userInitiated)
     var dictionaryPath: String?
+    var dictionaryText: [String]?
+    var modelName: String?
 
     func transcribe(audioURL: URL, completion: @escaping (String) -> Void) {
         queue.async {
@@ -389,7 +427,7 @@ final class TranscriptionRunner {
 
     private func runVadTranscriber(audioURL: URL) -> String {
         guard let vadPath = Paths.vadTranscriberURL,
-              let modelPath = Paths.whisperModelURL,
+              let modelPath = Paths.whisperModelURL(modelName: modelName),
               let sileroPath = Paths.sileroModelURL else {
             return ""
         }
@@ -399,9 +437,11 @@ final class TranscriptionRunner {
         var args = [
             "--audio-file", audioURL.path,
             "--silero-vad", sileroPath.path,
-            "--model", modelPath.path
+            "--model", modelPath.path,
+            "--pre-padding-ms", "400",
+            "--post-padding-ms", "300"
         ]
-        if let dictionaryURL = Paths.dictionaryURL(overridePath: dictionaryPath),
+        if let dictionaryURL = Paths.dictionaryURL(overridePath: dictionaryPath, dictionaryText: dictionaryText),
            FileManager.default.fileExists(atPath: dictionaryURL.path) {
             args += ["--dictionary-file", dictionaryURL.path]
         }
@@ -491,6 +531,8 @@ final class HistoryStore {
 struct Config: Codable {
     var apiKey: String?
     var dictionaryPath: String?
+    var dictionaryText: [String]?
+    var model: String?
 }
 
 final class ConfigStore {
@@ -501,6 +543,27 @@ final class ConfigStore {
         guard let data = try? Data(contentsOf: url) else { return }
         if let loaded = try? JSONDecoder().decode(Config.self, from: data) {
             config = loaded
+        } else {
+            if let raw = String(data: data, encoding: .utf8) {
+                print("[config] failed to parse ~/.openflow/config.json")
+                print("[config] raw:\n\(raw)")
+            } else {
+                print("[config] failed to parse ~/.openflow/config.json (unreadable)")
+            }
+        }
+    }
+
+    static func saveApiKey(_ key: String) {
+        guard let url = Paths.configURL else { return }
+        Paths.ensureConfigDir()
+        var config = Config()
+        if let data = try? Data(contentsOf: url),
+           let loaded = try? JSONDecoder().decode(Config.self, from: data) {
+            config = loaded
+        }
+        config.apiKey = key
+        if let data = try? JSONEncoder().encode(config) {
+            try? data.write(to: url)
         }
     }
 }
@@ -531,6 +594,103 @@ enum AccessibilityPaster {
     }
 }
 
+final class LLMRefiner {
+    var apiKey: String?
+    private let client = OpenRouterClient()
+
+    func refine(text: String, completion: @escaping (String) -> Void) {
+        guard let apiKey, !apiKey.isEmpty else {
+            completion(text)
+            return
+        }
+        client.refine(text: text, apiKey: apiKey) { result in
+            completion(result ?? text)
+        }
+    }
+}
+
+final class OpenRouterClient {
+    private let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+
+    func refine(text: String, apiKey: String, completion: @escaping (String?) -> Void) {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("https://openflow.local", forHTTPHeaderField: "HTTP-Referer")
+        request.setValue("OpenFlow", forHTTPHeaderField: "X-Title")
+
+        let systemPrompt = """
+You are a transcription refiner. Rewrite the user's dictated text into a clean output.
+- Fix punctuation, casing, and spacing. 
+- Remove filler words and disfluencies.
+- If the user self-corrects (e.g., "6, wait actually 7"), pretend they didn't make their mistake and fix the output accordingly.
+- Preserve the user's intent and meaning. Do not add new information.
+- Remove cues or tags like "[BLANK_AUDIO]" or *clears throat* or silence or coughing or laughter or other non-verbal sounds.
+Return only the refined text.
+"""
+
+        let payload: [String: Any] = [
+            "model": "openai/gpt-oss-20b",
+            "temperature": 0.05,
+            "max_tokens": 1000,
+            "reasoning": [
+                "effort": "high",
+                "max_tokens": 2000
+            ],
+            "provider": [
+                "order": ["groq"],
+                "allow_fallbacks": false
+            ],
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": text]
+            ]
+        ]
+
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            completion(nil)
+            return
+        }
+        request.httpBody = body
+
+        if let bodyString = String(data: body, encoding: .utf8) {
+            print("[openrouter] request: \(bodyString)")
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let response {
+                print("[openrouter] response: \(response)")
+            }
+            guard let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = obj["choices"] as? [[String: Any]],
+                  let message = choices.first?["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                if let data, let raw = String(data: data, encoding: .utf8) {
+                    print("[openrouter] response body: \(raw)")
+                }
+                completion(nil)
+                return
+            }
+            let reasoning = message["reasoning"] as? String
+            if let reasoning, !reasoning.isEmpty {
+                print("[openrouter] reasoning: \(reasoning)")
+            }
+            if let usage = obj["usage"] as? [String: Any],
+               let completionDetails = usage["completion_tokens_details"] as? [String: Any],
+               let reasoningTokens = completionDetails["reasoning_tokens"] {
+                print("[openrouter] reasoning_tokens: \(reasoningTokens)")
+            }
+            print("[openrouter] content: \(content)")
+            if let raw = String(data: data, encoding: .utf8) {
+                print("[openrouter] response body: \(raw)")
+            }
+            completion(content)
+        }.resume()
+    }
+}
+
 enum KeyCodes {
     static let command: CGKeyCode = 55
     static let v: CGKeyCode = 9
@@ -539,8 +699,7 @@ enum KeyCodes {
 enum Paths {
     static var configDirURL: URL? {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config", isDirectory: true)
-            .appendingPathComponent("openflow", isDirectory: true)
+            .appendingPathComponent(".openflow", isDirectory: true)
     }
 
     static var configURL: URL? {
@@ -551,11 +710,23 @@ enum Paths {
         configDirURL?.appendingPathComponent("history.jsonl")
     }
 
-    static func dictionaryURL(overridePath: String?) -> URL? {
+    static func dictionaryURL(overridePath: String?, dictionaryText: [String]?) -> URL? {
         if let overridePath, !overridePath.isEmpty {
             return URL(fileURLWithPath: overridePath)
         }
-        return configDirURL?.appendingPathComponent("dictionary.txt")
+        guard let dir = configDirURL else { return nil }
+        let url = dir.appendingPathComponent("dictionary.txt")
+        if let dictionaryText, !dictionaryText.isEmpty {
+            let joined = dictionaryText
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            if !joined.isEmpty {
+                ensureConfigDir()
+                try? joined.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+        return url
     }
 
     static var recordingURL: URL {
@@ -566,6 +737,10 @@ enum Paths {
     static func ensureConfigDir() {
         guard let url = configDirURL else { return }
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    static var bundleResourceURL: URL? {
+        Bundle.main.resourceURL
     }
 
     static var repoRootURL: URL? {
@@ -584,15 +759,31 @@ enum Paths {
     }
 
     static var clientDirURL: URL? {
-        repoRootURL?.appendingPathComponent("transcriber", isDirectory: true)
+        if let bundleResourceURL {
+            let candidate = bundleResourceURL.appendingPathComponent("transcriber", isDirectory: true)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return repoRootURL?.appendingPathComponent("transcriber", isDirectory: true)
     }
 
     static var vadTranscriberURL: URL? {
         clientDirURL?.appendingPathComponent("build/bin/vad_transcriber")
     }
 
-    static var whisperModelURL: URL? {
-        clientDirURL?.appendingPathComponent("whisper.cpp/models/ggml-base.en.bin")
+    static func whisperModelURL(modelName: String?) -> URL? {
+        let name = (modelName ?? "small").lowercased()
+        let file: String
+        switch name {
+        case "base":
+            file = "ggml-base.en.bin"
+        case "small":
+            file = "ggml-small.en.bin"
+        default:
+            file = "ggml-small.en.bin"
+        }
+        return clientDirURL?.appendingPathComponent("whisper.cpp/models/\(file)")
     }
 
     static var sileroModelURL: URL? {
