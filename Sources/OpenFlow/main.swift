@@ -16,7 +16,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var levelTimer: Timer?
     private var didRequestMic = false
     private let styleStore = StyleStore()
-    private var styleWindow: NSWindow?
+    private var settingsWindow: NSWindow?
+    private var settingsModel: SettingsViewModel?
+    private var settingsWindowDelegate: SettingsWindowDelegate?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -40,9 +42,6 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         transcriptionRunner.vadStop = configStore.config.vadStop
         styleStore.load(from: configStore.config)
         llmRefiner.styleStore = styleStore
-        if resolveApiKey() == nil {
-            promptForApiKeyIfNeeded()
-        }
         llmRefiner.apiKey = resolveApiKey()
         if let key = llmRefiner.apiKey {
             print("[openrouter] apiKey: \(KeyMasker.mask(key))")
@@ -53,6 +52,13 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupHotkey()
         showBubble()
+
+        if llmRefiner.apiKey == nil && configStore.config.didPromptForApiKey != true {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self.openSettings(tab: .openRouter)
+                self.configStore.markApiKeyPrompted()
+            }
+        }
     }
 
     private func setupStatusItem() {
@@ -67,6 +73,10 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         let reloadHistoryItem = NSMenuItem(title: "Reload History", action: #selector(reloadHistory), keyEquivalent: "r")
         reloadHistoryItem.target = self
         menu.addItem(reloadHistoryItem)
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -202,30 +212,70 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func manageStyles() {
-        if let window = styleWindow {
+        openSettings(tab: .styles)
+    }
+
+    @objc private func openSettingsFromMenu() {
+        openSettings(tab: .openRouter)
+    }
+
+    private func openSettings(tab: SettingsTab) {
+        if let window = settingsWindow {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
+            settingsModel?.selection = tab
             return
         }
-        let view = StylesManagerView(store: styleStore) { [weak self] in
-            guard let self else { return }
-            self.configStore.saveStyles(self.styleStore.styles, selectedId: self.styleStore.selectedStyleId)
-            self.refreshStylesMenu()
-        }
+
+        NSApp.setActivationPolicy(.regular)
+
+        let model = SettingsViewModel(
+            initialSelection: tab,
+            config: configStore.config,
+            onApiKeyChange: { [weak self] value in
+                guard let self else { return }
+                self.configStore.setApiKey(value)
+                self.llmRefiner.apiKey = self.resolveApiKey()
+            },
+            onDictionaryChange: { [weak self] text in
+                guard let self else { return }
+                self.configStore.setDictionary(text: text, path: nil)
+                self.transcriptionRunner.dictionaryText = self.configStore.config.dictionaryText
+            }
+        )
+        settingsModel = model
+
+        let view = SettingsView(
+            styleStore: styleStore,
+            onSaveStyles: { [weak self] in
+                guard let self else { return }
+                self.configStore.saveStyles(self.styleStore.styles, selectedId: self.styleStore.selectedStyleId)
+                self.refreshStylesMenu()
+            },
+            model: model
+        )
+
         let hosting = NSHostingView(rootView: view)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 480),
                               styleMask: [.titled, .closable, .resizable],
                               backing: .buffered,
                               defer: false)
-        window.title = "Manage Styles"
+        window.title = "OpenFlow Settings"
         window.contentView = hosting
         window.center()
-        window.level = .floating
+        let delegate = SettingsWindowDelegate { [weak self] in
+            self?.settingsWindow = nil
+            self?.settingsModel = nil
+            self?.settingsWindowDelegate = nil
+            NSApp.setActivationPolicy(.accessory)
+        }
+        window.delegate = delegate
+        settingsWindowDelegate = delegate
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
-        styleWindow = window
+        settingsWindow = window
     }
 
     private func rebuildHistoryMenu(_ menu: NSMenu) {
@@ -326,25 +376,6 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func requestMicrophoneIfNeeded() {
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
-    }
-
-    private func promptForApiKeyIfNeeded() {
-        if configStore.config.didPromptForApiKey == true {
-            return
-        }
-        let alert = NSAlert()
-        alert.messageText = "Enter OpenRouter API Key"
-        alert.informativeText = "Optional: used for LLM refinement. You can set it later in ~/.openflow/config.json or OPENROUTER_API_KEY."
-        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Skip")
-        let response = alert.runModal()
-        let trimmed = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if response == .alertFirstButtonReturn, !trimmed.isEmpty {
-            configStore.setApiKey(trimmed)
-        }
-        configStore.markApiKeyPrompted()
     }
 
     private func resolveApiKey() -> String? {
@@ -451,9 +482,10 @@ struct StylesManagerView: View {
     var body: some View {
         VStack(spacing: 12) {
             Text("Pick a style for the LLM to apply after transcription. You can edit or add your own.")
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -466,13 +498,14 @@ struct StylesManagerView: View {
                                 } label: {
                                     Text(style.name)
                                         .frame(maxWidth: .infinity, alignment: .leading)
-                                        .padding(.vertical, 6)
-                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 10)
                                         .background(
                                             RoundedRectangle(cornerRadius: 6)
-                                                .fill(style.id == store.selectedStyleId ? Color.accentColor.opacity(0.35) : Color.clear)
+                                                .fill(style.id == store.selectedStyleId ? Color.accentColor.opacity(0.35) : Color.gray.opacity(0.08))
                                         )
                                 }
+                                .contentShape(Rectangle())
                                 .buttonStyle(.plain)
                             }
                         }
@@ -497,14 +530,21 @@ struct StylesManagerView: View {
                         Text("Style name")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        TextField("Name", text: nameBinding(index))
+                        TextField("Style name", text: nameBinding(index))
                             .textFieldStyle(.roundedBorder)
+                            .textSelection(.enabled)
                         Text("Style description")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         TextEditor(text: promptBinding(index))
-                            .font(.system(size: 12))
+                            .font(.system(size: 13))
                             .frame(minHeight: 180)
+                            .textSelection(.enabled)
+                            .padding(6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(Color(NSColor.textBackgroundColor))
+                            )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
                                     .stroke(Color.gray.opacity(0.3))
@@ -525,7 +565,7 @@ struct StylesManagerView: View {
             }
         }
         .padding(12)
-        .frame(minWidth: 520, minHeight: 360)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear { onSave() }
         .onChange(of: store.styles) { _ in onSave() }
         .onChange(of: store.selectedStyleId) { _ in onSave() }
@@ -540,15 +580,143 @@ struct StylesManagerView: View {
     private func nameBinding(_ index: Int) -> Binding<String> {
         Binding(
             get: { store.styles[index].name },
-            set: { store.styles[index].name = $0 }
+            set: { value in
+                var styles = store.styles
+                guard styles.indices.contains(index) else { return }
+                styles[index].name = value
+                store.styles = styles
+            }
         )
     }
 
     private func promptBinding(_ index: Int) -> Binding<String> {
         Binding(
             get: { store.styles[index].systemPrompt },
-            set: { store.styles[index].systemPrompt = $0 }
+            set: { value in
+                var styles = store.styles
+                guard styles.indices.contains(index) else { return }
+                styles[index].systemPrompt = value
+                store.styles = styles
+            }
         )
+    }
+}
+
+enum SettingsTab: String, CaseIterable, Identifiable {
+    case openRouter = "OpenRouter"
+    case styles = "Styles"
+    case dictionary = "Dictionary"
+
+    var id: String { rawValue }
+    var title: String { rawValue }
+}
+
+final class SettingsViewModel: ObservableObject {
+    @Published var selection: SettingsTab
+    @Published var apiKey: String
+    @Published var dictionaryText: String
+
+    let onApiKeyChange: (String) -> Void
+    let onDictionaryChange: (String) -> Void
+
+    init(initialSelection: SettingsTab,
+         config: Config,
+         onApiKeyChange: @escaping (String) -> Void,
+         onDictionaryChange: @escaping (String) -> Void) {
+        self.selection = initialSelection
+        self.apiKey = config.apiKey ?? ""
+        self.dictionaryText = (config.dictionaryText ?? []).joined(separator: "\n")
+        self.onApiKeyChange = onApiKeyChange
+        self.onDictionaryChange = onDictionaryChange
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var styleStore: StyleStore
+    var onSaveStyles: () -> Void
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        HStack(spacing: 0) {
+            List(SettingsTab.allCases, selection: $model.selection) { tab in
+                Text(tab.title).tag(tab)
+            }
+            .listStyle(.sidebar)
+            .frame(width: 200)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 16) {
+                switch model.selection {
+                case .openRouter:
+                    openRouterTab
+                case .styles:
+                    StylesManagerView(store: styleStore, onSave: onSaveStyles)
+                case .dictionary:
+                    dictionaryTab
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(20)
+        }
+        .frame(minWidth: 760, minHeight: 480)
+    }
+
+    private var openRouterTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("OpenRouter")
+                .font(.system(size: 18, weight: .semibold))
+            Text("Set your API key for LLM refinement. It’s stored in ~/.openflow/config.json.")
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+            TextField("sk-or-...", text: $model.apiKey)
+                .textFieldStyle(.roundedBorder)
+                .textSelection(.enabled)
+                .font(.system(size: 13))
+                .onChange(of: model.apiKey) { value in
+                    model.onApiKeyChange(value)
+                }
+            Spacer()
+        }
+    }
+
+    private var dictionaryTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Custom Dictionary")
+                .font(.system(size: 18, weight: .semibold))
+            Text("Add words or phrases to bias recognition. One entry per line.")
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+            TextEditor(text: $model.dictionaryText)
+                .font(.system(size: 13))
+                .frame(minHeight: 220)
+                .textSelection(.enabled)
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(NSColor.textBackgroundColor))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.gray.opacity(0.3))
+                )
+                .onChange(of: model.dictionaryText) { value in
+                    model.onDictionaryChange(value)
+                }
+            Spacer()
+        }
+    }
+}
+
+final class SettingsWindowDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose()
     }
 }
 
@@ -1123,7 +1291,19 @@ final class StyleStore: ObservableObject {
 
     func load(from config: Config) {
         if let stored = config.styles, !stored.isEmpty {
-            styles = stored
+            let defaults = Self.defaultStyles()
+            styles = stored.map { style in
+                var merged = style
+                if merged.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let def = defaults.first(where: { $0.id == merged.id }) {
+                    merged.systemPrompt = def.systemPrompt
+                }
+                if merged.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let def = defaults.first(where: { $0.id == merged.id }) {
+                    merged.name = def.name
+                }
+                return merged
+            }
         } else {
             styles = Self.defaultStyles()
         }
@@ -1231,6 +1411,20 @@ final class ConfigStore {
     func setApiKey(_ key: String) {
         var updated = config
         updated.apiKey = key
+        writeConfig(updated)
+    }
+
+    func setDictionary(text: String, path: String?) {
+        var updated = config
+        let entries = text
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        updated.dictionaryText = entries.isEmpty ? nil : entries
+        if let path {
+            let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            updated.dictionaryPath = trimmedPath.isEmpty ? nil : trimmedPath
+        }
         writeConfig(updated)
     }
 
