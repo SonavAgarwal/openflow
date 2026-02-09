@@ -14,12 +14,12 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private let transcriptionRunner = TranscriptionRunner()
     private let llmRefiner = LLMRefiner()
     private var levelTimer: Timer?
-    private var didRequestMic = false
     private let styleStore = StyleStore()
     private var settingsWindow: NSWindow?
     private var settingsModel: SettingsViewModel?
     private var settingsWindowDelegate: SettingsWindowDelegate?
     private var usesStatusImage = false
+    private var didShowMicDeniedAlert = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -155,14 +155,17 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func startListening() {
         guard !bubbleState.isListening else { return }
-        if !didRequestMic {
-            didRequestMic = true
-            requestMicrophoneIfNeeded()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                self.startListening()
+        ensureMicrophoneAccess { [weak self] granted in
+            guard let self else { return }
+            guard granted else {
+                showMicrophonePermissionAlertIfNeeded()
+                return
             }
-            return
+            beginListening()
         }
+    }
+
+    private func beginListening() {
         bubbleState.isListening = true
         updateStatusIcon()
         do {
@@ -202,6 +205,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
                 Task { @MainActor in
                     self.historyStore.append(text: finalText)
                     self.refreshHistoryMenu()
+                    guard self.ensureAccessibilityForInsertion() else { return }
                     AccessibilityPaster.paste(finalText)
                     let tInserted = Date()
                     TimingLogger.log(
@@ -382,11 +386,15 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     }
 
     private func loadStatusIcon() -> NSImage? {
+        if let url = Bundle.main.resourceURL?.appendingPathComponent("StatusIcon.png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
         if let url = Bundle.module.url(forResource: "StatusIcon", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
-        return NSImage(named: "StatusIcon")
+        return nil
     }
 
     @objc private func copyHistoryItem(_ sender: NSMenuItem) {
@@ -423,17 +431,67 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         if AXIsProcessTrusted() {
             return
         }
-        if configStore.config.didPromptForAccessibility == true {
-            return
-        }
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         let key = "AXTrustedCheckOptionPrompt" as CFString
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
-        configStore.markAccessibilityPrompted()
     }
 
-    private func requestMicrophoneIfNeeded() {
-        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+    private func ensureAccessibilityForInsertion() -> Bool {
+        if AXIsProcessTrusted() {
+            return true
+        }
+        requestAccessibilityIfNeeded()
+
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Accessibility Access Required"
+        alert.informativeText = "OpenFlow can transcribe your speech, but macOS must grant Accessibility access to paste into the focused app."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        return false
+    }
+
+    private func ensureMicrophoneAccess(_ completion: @escaping (Bool) -> Void) {
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch status {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    completion(granted)
+                }
+            }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
+    private func showMicrophonePermissionAlertIfNeeded() {
+        if didShowMicDeniedAlert { return }
+        didShowMicDeniedAlert = true
+
+        let alert = NSAlert()
+        alert.messageText = "Microphone Access Required"
+        alert.informativeText = "OpenFlow needs microphone permission to transcribe. Enable it in System Settings > Privacy & Security > Microphone."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private func resolveApiKey() -> String? {
@@ -1478,6 +1536,9 @@ final class ConfigStore {
         if let path {
             let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
             updated.dictionaryPath = trimmedPath.isEmpty ? nil : trimmedPath
+        } else {
+            // Clear stale absolute overrides when settings no longer manages a path.
+            updated.dictionaryPath = nil
         }
         writeConfig(updated)
     }
@@ -1856,9 +1917,7 @@ enum Paths {
     }
 
     static func dictionaryURL(overridePath: String?, dictionaryText: [String]?) -> URL? {
-        if let overridePath, !overridePath.isEmpty {
-            return URL(fileURLWithPath: overridePath)
-        }
+        _ = overridePath
         guard let dir = configDirURL else { return nil }
         let url = dir.appendingPathComponent("dictionary.txt")
         if let dictionaryText, !dictionaryText.isEmpty {
@@ -1888,33 +1947,18 @@ enum Paths {
         Bundle.main.resourceURL
     }
 
-    static var repoRootURL: URL? {
-        let start = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-        var cursor = start.deletingLastPathComponent()
-        for _ in 0..<10 {
-            let candidate = cursor.appendingPathComponent("transcriber", isDirectory: true)
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return cursor
-            }
-            let next = cursor.deletingLastPathComponent()
-            if next.path == cursor.path { break }
-            cursor = next
-        }
-        return nil
-    }
-
-    static var clientDirURL: URL? {
+    static var transcriberDirURL: URL? {
         if let bundleResourceURL {
             let candidate = bundleResourceURL.appendingPathComponent("transcriber", isDirectory: true)
             if FileManager.default.fileExists(atPath: candidate.path) {
                 return candidate
             }
         }
-        return repoRootURL?.appendingPathComponent("transcriber", isDirectory: true)
+        return nil
     }
 
     static var vadTranscriberURL: URL? {
-        clientDirURL?.appendingPathComponent("build/bin/openflow_transcriber")
+        transcriberDirURL?.appendingPathComponent("build/bin/openflow_transcriber")
     }
 
     static func whisperModelURL(modelName: String?) -> URL? {
@@ -1928,11 +1972,11 @@ enum Paths {
         default:
             file = "ggml-small.en.bin"
         }
-        return clientDirURL?.appendingPathComponent("whisper.cpp/models/\(file)")
+        return transcriberDirURL?.appendingPathComponent("whisper.cpp/models/\(file)")
     }
 
     static var sileroModelURL: URL? {
-        clientDirURL?.appendingPathComponent("whisper.cpp/models/ggml-silero-v5.1.2.bin")
+        transcriberDirURL?.appendingPathComponent("whisper.cpp/models/ggml-silero-v5.1.2.bin")
     }
 }
 

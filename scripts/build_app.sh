@@ -17,6 +17,7 @@ SILERO_MODEL="${WHISPER_MODELS_DIR}/ggml-silero-v5.1.2.bin"
 
 INFO_PLIST="${CONTENTS_DIR}/Info.plist"
 APP_ICON_PNG="${ROOT_DIR}/assets/openflow_circle_1024.png"
+STATUS_ICON_PNG="${ROOT_DIR}/openflow.png"
 
 echo "==> Building Swift app (release)"
 cd "${ROOT_DIR}"
@@ -84,6 +85,15 @@ chmod +x "${MACOS_DIR}/${APP_NAME}"
 if [ -f "${APP_ICON_PNG}" ]; then
   cp "${APP_ICON_PNG}" "${RESOURCES_DIR}/AppIcon.png"
 fi
+if [ -f "${STATUS_ICON_PNG}" ]; then
+  cp "${STATUS_ICON_PNG}" "${RESOURCES_DIR}/StatusIcon.png"
+fi
+
+# Copy SwiftPM resource bundles (e.g., OpenFlow resources for Bundle.module).
+for bundle in "${ROOT_DIR}"/.build/arm64-apple-macosx/release/*.bundle; do
+  [ -e "${bundle}" ] || continue
+  cp -R "${bundle}" "${RESOURCES_DIR}/"
+done
 
 # Bundle transcriber binaries + models
 mkdir -p "${RESOURCES_DIR}/transcriber/build/bin"
