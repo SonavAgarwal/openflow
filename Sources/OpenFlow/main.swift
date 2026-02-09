@@ -67,8 +67,10 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let image = loadStatusIcon() {
             image.isTemplate = true
+            image.size = NSSize(width: 16, height: 16)
             item.button?.image = image
             item.button?.title = ""
+            item.button?.imagePosition = .imageOnly
             usesStatusImage = true
         } else {
             item.button?.title = "OF"
@@ -371,9 +373,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
         if usesStatusImage {
             button.title = ""
-            button.contentTintColor = bubbleState.isListening ? .systemRed : nil
+            button.contentTintColor = nil
+            button.alphaValue = bubbleState.isListening ? 0.5 : 1.0
         } else {
             button.title = bubbleState.isListening ? "●" : "OF"
+            button.alphaValue = 1.0
         }
     }
 
