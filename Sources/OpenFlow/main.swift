@@ -1,6 +1,6 @@
 import AppKit
 import SwiftUI
-import AVFoundation
+@preconcurrency import AVFoundation
 
 @MainActor
 final class OpenFlowApp: NSObject, NSApplicationDelegate {
@@ -19,6 +19,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var settingsModel: SettingsViewModel?
     private var settingsWindowDelegate: SettingsWindowDelegate?
+    private var usesStatusImage = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -64,7 +65,15 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "OF"
+        if let image = loadStatusIcon() {
+            image.isTemplate = true
+            item.button?.image = image
+            item.button?.title = ""
+            usesStatusImage = true
+        } else {
+            item.button?.title = "OF"
+            usesStatusImage = false
+        }
 
         let menu = NSMenu()
         let toggleBubbleItem = NSMenuItem(title: "Toggle Bubble", action: #selector(toggleBubble), keyEquivalent: "b")
@@ -121,13 +130,13 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
         editMenuItem.submenu = editMenu
-        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
-        editMenu.addItem(NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z"))
+        editMenu.addItem(NSMenuItem(title: "Undo", action: #selector(UndoManager.undo), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem(title: "Redo", action: #selector(UndoManager.redo), keyEquivalent: "Z"))
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(NSMenuItem(title: "Cut", action: Selector(("cut:")), keyEquivalent: "x"))
-        editMenu.addItem(NSMenuItem(title: "Copy", action: Selector(("copy:")), keyEquivalent: "c"))
-        editMenu.addItem(NSMenuItem(title: "Paste", action: Selector(("paste:")), keyEquivalent: "v"))
-        editMenu.addItem(NSMenuItem(title: "Select All", action: Selector(("selectAll:")), keyEquivalent: "a"))
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
 
         NSApp.mainMenu = mainMenu
     }
@@ -176,6 +185,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         let refiner = llmRefiner
         let tRelease = Date()
 
+        let context = AccessibilityContext.capture(maxBefore: 500, maxAfter: 500)
         transcriptionRunner.stopStreaming { [weak self] text in
             guard let self else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -183,7 +193,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             print("[transcription] heard: \(trimmed)")
             let tWhisperDone = Date()
             let tLLMStart = Date()
-            refiner.refine(text: trimmed) { [weak self] refined in
+            refiner.refine(text: trimmed, context: context) { [weak self] refined in
                 guard let self else { return }
                 let tLLMDone = Date()
                 let finalText = refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : refined
@@ -359,7 +369,20 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func updateStatusIcon() {
         guard let button = statusItem?.button else { return }
-        button.title = bubbleState.isListening ? "●" : "OF"
+        if usesStatusImage {
+            button.title = ""
+            button.contentTintColor = bubbleState.isListening ? .systemRed : nil
+        } else {
+            button.title = bubbleState.isListening ? "●" : "OF"
+        }
+    }
+
+    private func loadStatusIcon() -> NSImage? {
+        if let url = Bundle.module.url(forResource: "StatusIcon", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        return NSImage(named: "StatusIcon")
     }
 
     @objc private func copyHistoryItem(_ sender: NSMenuItem) {
@@ -396,9 +419,13 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         if AXIsProcessTrusted() {
             return
         }
+        if configStore.config.didPromptForAccessibility == true {
+            return
+        }
         let key = "AXTrustedCheckOptionPrompt" as CFString
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+        configStore.markAccessibilityPrompted()
     }
 
     private func requestMicrophoneIfNeeded() {
@@ -416,15 +443,10 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
-struct OpenFlowMain {
-    static func main() {
-        let app = NSApplication.shared
-        let delegate = OpenFlowApp()
-        app.delegate = delegate
-        app.run()
-    }
-}
+let app = NSApplication.shared
+let delegate = OpenFlowApp()
+app.delegate = delegate
+app.run()
 
 final class BubbleWindow: NSPanel {
     init(content: NSView, size: NSSize) {
@@ -1392,6 +1414,7 @@ final class StyleStore: ObservableObject {
 struct Config: Codable {
     var apiKey: String?
     var didPromptForApiKey: Bool?
+    var didPromptForAccessibility: Bool?
     var dictionaryPath: String?
     var dictionaryText: [String]?
     var model: String?
@@ -1458,6 +1481,12 @@ final class ConfigStore {
     func markApiKeyPrompted() {
         var updated = config
         updated.didPromptForApiKey = true
+        writeConfig(updated)
+    }
+
+    func markAccessibilityPrompted() {
+        var updated = config
+        updated.didPromptForAccessibility = true
         writeConfig(updated)
     }
 
@@ -1570,18 +1599,80 @@ enum AccessibilityPaster {
     }
 }
 
+struct AccessibilityContext {
+    let before: String?
+    let after: String?
+    let selected: String?
+
+    var hasAny: Bool {
+        if let before, !before.isEmpty { return true }
+        if let after, !after.isEmpty { return true }
+        if let selected, !selected.isEmpty { return true }
+        return false
+    }
+
+    static func capture(maxBefore: Int, maxAfter: Int) -> AccessibilityContext? {
+        let system = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focused = focusedRef as! AXUIElement? else {
+            return nil
+        }
+
+        var valueRef: CFTypeRef?
+        let valueStatus = AXUIElementCopyAttributeValue(focused, kAXValueAttribute as CFString, &valueRef)
+        let fullText = (valueStatus == .success) ? (valueRef as? String) : nil
+
+        var selectedText: String?
+        var selectedRange: CFRange?
+        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &valueRef) == .success {
+            selectedText = valueRef as? String
+        }
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           let rangeRef,
+           CFGetTypeID(rangeRef) == AXValueGetTypeID() {
+            let axValue = rangeRef as! AXValue
+            var range = CFRange()
+            if AXValueGetValue(axValue, .cfRange, &range) {
+                selectedRange = range
+            }
+        }
+
+        guard let fullText else {
+            if selectedText == nil { return nil }
+            return AccessibilityContext(before: nil, after: nil, selected: selectedText)
+        }
+
+        let nsText = fullText as NSString
+        let textLength = nsText.length
+        let range = selectedRange ?? CFRange(location: textLength, length: 0)
+        let cursorLocation = max(0, min(textLength, range.location))
+
+        let beforeStart = max(0, cursorLocation - maxBefore)
+        let beforeLen = cursorLocation - beforeStart
+        let afterStart = min(textLength, cursorLocation + range.length)
+        let afterLen = min(maxAfter, textLength - afterStart)
+
+        let before = beforeLen > 0 ? nsText.substring(with: NSRange(location: beforeStart, length: beforeLen)) : nil
+        let after = afterLen > 0 ? nsText.substring(with: NSRange(location: afterStart, length: afterLen)) : nil
+
+        return AccessibilityContext(before: before, after: after, selected: selectedText)
+    }
+}
+
 final class LLMRefiner: @unchecked Sendable {
     var apiKey: String?
     var styleStore: StyleStore?
     private let client = OpenRouterClient()
 
-    func refine(text: String, completion: @escaping @Sendable (String) -> Void) {
+    func refine(text: String, context: AccessibilityContext?, completion: @escaping @Sendable (String) -> Void) {
         guard let apiKey, !apiKey.isEmpty else {
             completion(text)
             return
         }
         let styleGuide = styleStore?.selectedStyle?.systemPrompt
-        client.refine(text: text, apiKey: apiKey, styleGuide: styleGuide) { result in
+        client.refine(text: text, apiKey: apiKey, styleGuide: styleGuide, context: context) { result in
             completion(result ?? text)
         }
     }
@@ -1590,7 +1681,7 @@ final class LLMRefiner: @unchecked Sendable {
 final class OpenRouterClient {
     private let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 
-    func refine(text: String, apiKey: String, styleGuide: String?, completion: @escaping @Sendable (String?) -> Void) {
+    func refine(text: String, apiKey: String, styleGuide: String?, context: AccessibilityContext?, completion: @escaping @Sendable (String?) -> Void) {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1598,7 +1689,7 @@ final class OpenRouterClient {
         request.setValue("https://openflow.local", forHTTPHeaderField: "HTTP-Referer")
         request.setValue("OpenFlow", forHTTPHeaderField: "X-Title")
 
-        let systemPrompt = buildSystemPrompt(styleGuide: styleGuide)
+        let systemPrompt = buildSystemPrompt(styleGuide: styleGuide, context: context)
 
         let payload: [String: Any] = [
             "model": "openai/gpt-oss-120b",
@@ -1635,7 +1726,7 @@ final class OpenRouterClient {
         }.resume()
     }
 
-    private func buildSystemPrompt(styleGuide: String?) -> String {
+    private func buildSystemPrompt(styleGuide: String?, context: AccessibilityContext?) -> String {
         let guide = (styleGuide?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? styleGuide!
             : "Neutral, clear, friendly."
@@ -1702,7 +1793,20 @@ THIS IS NOT A CONVERSATION. DO NOT REPLY TO THE USER. ONLY RESPOND WITH THE REWR
 
 STYLE GUIDE: \(guide)
 """
-        return systemPrompt
+        var prompt = systemPrompt
+        if let context, context.hasAny {
+            prompt += "\n\nSURROUNDING CONTEXT (for reference only; do not quote unless it helps disambiguate):\n"
+            if let before = context.before, !before.isEmpty {
+                prompt += "TEXT BEFORE CURSOR:\n\(before)\n"
+            }
+            if let selected = context.selected, !selected.isEmpty {
+                prompt += "SELECTED TEXT:\n\(selected)\n"
+            }
+            if let after = context.after, !after.isEmpty {
+                prompt += "TEXT AFTER CURSOR:\n\(after)\n"
+            }
+        }
+        return prompt
     }
 }
 

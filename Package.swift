@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "OpenFlow",
-            path: "Sources/OpenFlow"
+            path: "Sources/OpenFlow",
+            resources: [
+                .process("Resources")
+            ]
         )
     ]
 )

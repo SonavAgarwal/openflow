@@ -16,6 +16,7 @@ SMALL_MODEL="${WHISPER_MODELS_DIR}/ggml-small.en.bin"
 SILERO_MODEL="${WHISPER_MODELS_DIR}/ggml-silero-v5.1.2.bin"
 
 INFO_PLIST="${CONTENTS_DIR}/Info.plist"
+APP_ICON_PNG="${ROOT_DIR}/assets/openflow_circle_1024.png"
 
 echo "==> Building Swift app (release)"
 cd "${ROOT_DIR}"
@@ -55,6 +56,8 @@ cat > "${INFO_PLIST}" <<PLIST
   <string>${APP_NAME}</string>
   <key>CFBundleDisplayName</key>
   <string>${APP_NAME}</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>com.openflow.app</string>
   <key>CFBundleVersion</key>
@@ -77,6 +80,10 @@ PLIST
 
 cp "${SWIFT_BIN}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
+
+if [ -f "${APP_ICON_PNG}" ]; then
+  cp "${APP_ICON_PNG}" "${RESOURCES_DIR}/AppIcon.png"
+fi
 
 # Bundle transcriber binaries + models
 mkdir -p "${RESOURCES_DIR}/transcriber/build/bin"
