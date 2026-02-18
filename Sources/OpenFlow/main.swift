@@ -24,6 +24,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var didShowMicDeniedAlert = false
     private var selectedMicUID: String?
     private var fnPressActive = false
+    private var lastFnUpTime: Date?
+    private static let fnCooldown: TimeInterval = 0.15
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -62,6 +64,9 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         historyStore.load()
         setupStatusItem()
         setupHotkey()
+        MicrophoneCatalog.onDeviceListChanged { [weak self] in
+            self?.refreshMicrophoneMenu()
+        }
         showBubble()
 
         if llmRefiner.apiKey == nil && configStore.config.didPromptForApiKey != true {
@@ -173,6 +178,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func handleFnDown() {
         print("[hotkey] fn DOWN")
+        // Ignore rapid fn presses (cooldown after last release)
+        if let lastUp = lastFnUpTime, Date().timeIntervalSince(lastUp) < Self.fnCooldown {
+            print("[hotkey] fn DOWN ignored (cooldown)")
+            return
+        }
         fnPressActive = true
         startListening()
     }
@@ -180,6 +190,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private func handleFnUp() {
         print("[hotkey] fn UP  isListening=\(bubbleState.isListening)")
         fnPressActive = false
+        lastFnUpTime = Date()
         stopListening()
     }
 
@@ -918,6 +929,27 @@ struct MicrophoneOption {
 }
 
 enum MicrophoneCatalog {
+    nonisolated(unsafe) private static var deviceChangeCallback: (() -> Void)?
+    nonisolated(unsafe) private static var listenerInstalled = false
+
+    static func onDeviceListChanged(_ callback: @escaping () -> Void) {
+        deviceChangeCallback = callback
+        guard !listenerInstalled else { return }
+        listenerInstalled = true
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propertyAddress,
+            DispatchQueue.main
+        ) { _, _ in
+            deviceChangeCallback?()
+        }
+    }
+
     static func available() -> [MicrophoneOption] {
         allDeviceIDs()
             .filter { hasInput(deviceID: $0) }
@@ -1106,7 +1138,7 @@ final class HotkeyMonitor: @unchecked Sendable {
 }
 
 final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
-    private let engine = AVAudioEngine()
+    private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private var onPCM: (([Float]) -> Void)?
@@ -1116,6 +1148,12 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
 
     func setPreferredInputDeviceUID(_ uid: String?) {
         preferredInputDeviceUID = uid
+        // Switch the system default input device immediately so the next
+        // AVAudioEngine session (and any currently running one) uses it.
+        if let uid {
+            let ok = MicrophoneCatalog.setDefaultInputDevice(forUID: uid)
+            print("[audio] setDefaultInputDevice(\(uid)) = \(ok)")
+        }
     }
 
     func startStreaming(onPCM: @escaping ([Float]) -> Void) throws {
@@ -1123,12 +1161,20 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
         isRunning = true
         self.onPCM = onPCM
 
-        let input = engine.inputNode
+        // Set the system default input device before creating the engine,
+        // so AVAudioEngine's inputNode latches onto the correct device.
         if let uid = preferredInputDeviceUID {
-            _ = MicrophoneCatalog.setDefaultInputDevice(forUID: uid)
-            _ = Self.setInputDevice(for: input, deviceUID: uid)
+            let ok = MicrophoneCatalog.setDefaultInputDevice(forUID: uid)
+            print("[audio] setDefaultInputDevice(\(uid)) = \(ok)")
         }
+
+        // Create a fresh engine each time so inputNode picks up the current default.
+        let engine = AVAudioEngine()
+        self.engine = engine
+
+        let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
+        print("[audio] inputFormat: \(inputFormat)")
         converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
@@ -1156,15 +1202,15 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
 
         engine.prepare()
         try engine.start()
-        if let uid = preferredInputDeviceUID {
-            _ = Self.setInputDevice(for: input, deviceUID: uid)
-        }
     }
 
     func stopStreaming() {
         guard isRunning else { return }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        engine = nil
         isRunning = false
         onPCM = nil
         lastLevel = 0
@@ -1185,21 +1231,6 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
         let db = 20.0 * log10(max(rms, 1e-6))
         let normalized = (db + 60.0) / 60.0
         return min(1.0, max(0.0, normalized))
-    }
-
-    private static func setInputDevice(for inputNode: AVAudioInputNode, deviceUID: String) -> Bool {
-        guard let deviceID = MicrophoneCatalog.audioDeviceID(forUID: deviceUID) else { return false }
-        guard let audioUnit = inputNode.audioUnit else { return false }
-        var mutableDeviceID = deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &mutableDeviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        return status == noErr
     }
 }
 
