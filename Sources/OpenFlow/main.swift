@@ -4,6 +4,82 @@ import SwiftUI
 import AudioToolbox
 import CoreAudio
 
+private let silentFalsePositiveTranscriptKey = "thanks for watching"
+
+private func normalizeTranscriptKey(_ text: String) -> String {
+    let lowered = text.lowercased()
+    let cleaned = lowered.replacingOccurrences(of: "[^\\p{L}\\p{N}\\s]+", with: " ", options: .regularExpression)
+    return cleaned.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
+private func levenshteinDistance(_ lhs: String, _ rhs: String) -> Int {
+    if lhs == rhs { return 0 }
+    if lhs.isEmpty { return rhs.count }
+    if rhs.isEmpty { return lhs.count }
+
+    let a = Array(lhs)
+    let b = Array(rhs)
+    var previous = Array(0...b.count)
+
+    for i in 1...a.count {
+        var current = Array(repeating: 0, count: b.count + 1)
+        current[0] = i
+
+        for j in 1...b.count {
+            let cost = a[i - 1] == b[j - 1] ? 0 : 1
+            current[j] = min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + cost
+            )
+        }
+        previous = current
+    }
+    return previous[b.count]
+}
+
+private func isCloseToSilentFalsePositive(_ normalized: String) -> Bool {
+    guard !normalized.isEmpty else { return false }
+    if normalized == silentFalsePositiveTranscriptKey { return true }
+    if normalized.contains(silentFalsePositiveTranscriptKey) { return true }
+    if silentFalsePositiveTranscriptKey.contains(normalized), normalized.count >= silentFalsePositiveTranscriptKey.count - 6 {
+        return true
+    }
+    if levenshteinDistance(normalized, silentFalsePositiveTranscriptKey) <= 4 {
+        return true
+    }
+
+    let tokens = normalized.split(separator: " ").map(String.init)
+    if tokens.count >= 3 {
+        for idx in 0...(tokens.count - 3) {
+            let window = tokens[idx...(idx + 2)].joined(separator: " ")
+            if levenshteinDistance(window, silentFalsePositiveTranscriptKey) <= 2 {
+                return true
+            }
+        }
+    }
+
+    return false
+}
+
+private func suppressSilentFalsePositiveIfNeeded(_ text: String) -> String {
+    let normalized = normalizeTranscriptKey(text)
+    guard isCloseToSilentFalsePositive(normalized) else { return text }
+    return ""
+}
+
+private func sanitizeBubblePartialText(_ text: String) -> String {
+    // Remove bracketed non-speech tags like [BLANK_AUDIO], [MUSIC], etc.
+    let withoutBracketTags = text.replacingOccurrences(
+        of: #"\[[^\[\]\n]{1,40}\]"#,
+        with: " ",
+        options: .regularExpression
+    )
+    return withoutBracketTags
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 @MainActor
 final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
@@ -53,6 +129,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         transcriptionRunner.beamSize = configStore.config.beamSize
         transcriptionRunner.vadStart = configStore.config.vadStart
         transcriptionRunner.vadStop = configStore.config.vadStop
+        transcriptionRunner.onPartialText = { [weak self] text in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard self.bubbleState.isListening else { return }
+                let filtered = suppressSilentFalsePositiveIfNeeded(text)
+                self.bubbleState.partialText = sanitizeBubblePartialText(filtered)
+            }
+        }
         styleStore.load(from: configStore.config)
         llmRefiner.styleStore = styleStore
         llmRefiner.apiKey = resolveApiKey()
@@ -221,6 +305,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private func beginListening() {
         guard !bubbleState.isListening else { return }
         print("[listen] beginListening")
+        bubbleState.partialText = ""
         showBubble()
         bubbleState.isListening = true
         bubbleWindow?.setBubbleSize(isListening: true)
@@ -248,6 +333,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         }
         print("[listen] stopListening")
         bubbleState.isListening = false
+        bubbleState.partialText = ""
         bubbleWindow?.setBubbleSize(isListening: false)
         bubbleWindow?.orderFrontRegardless()
         updateStatusIcon()
@@ -259,7 +345,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         let context = AccessibilityContext.capture(maxBefore: 500, maxAfter: 500)
         transcriptionRunner.stopStreaming { [weak self] text in
             guard let self else { return }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let filtered = suppressSilentFalsePositiveIfNeeded(text)
+            let trimmed = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             print("[transcription] heard: \(trimmed)")
             let tWhisperDone = Date()
@@ -267,7 +354,10 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             refiner.refine(text: trimmed, context: context) { [weak self] refined in
                 guard let self else { return }
                 let tLLMDone = Date()
-                let finalText = refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : refined
+                let llmText = refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : refined
+                let finalFiltered = suppressSilentFalsePositiveIfNeeded(llmText)
+                let finalText = finalFiltered.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !finalText.isEmpty else { return }
                 Task { @MainActor in
                     self.historyStore.append(text: finalText)
                     self.refreshHistoryMenu()
@@ -443,7 +533,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         if bubbleWindow == nil {
             let view = BubbleView().environmentObject(bubbleState)
             let hosting = NSHostingView(rootView: view)
-            let panel = BubbleWindow(content: hosting, size: NSSize(width: 160, height: 32))
+            let panel = BubbleWindow(content: hosting, size: NSSize(width: BubbleLayout.listeningWidth, height: BubbleLayout.height))
             panel.positionBottomCenter()
             bubbleWindow = panel
         }
@@ -627,14 +717,34 @@ final class BubbleWindow: NSPanel {
     }
 
     func setBubbleSize(isListening: Bool) {
+        var frame = self.frame
+        frame.size = NSSize(
+            width: isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth,
+            height: BubbleLayout.height
+        )
+        setFrame(frame, display: true)
         positionBottomCenter()
     }
+}
+
+private enum BubbleLayout {
+    static let listeningWidth: CGFloat = 200
+    static let idleWidth: CGFloat = 24
+    static let height: CGFloat = 32
+    static let idleHeight: CGFloat = 6
+    static let contentLeadingPadding: CGFloat = 6
+    static let contentTrailingPadding: CGFloat = 10
+    static let dotRegionWidth: CGFloat = 20
+    static let audioStripWidth: CGFloat = 32
+    static let textToAudioGap: CGFloat = 4
+    static let audioTrailingPadding: CGFloat = 4
 }
 
 final class BubbleState: ObservableObject {
     @Published var isListening = false
     @Published var level: Double = 0
     @Published var levelHistory: [Double] = Array(repeating: 0, count: 12)
+    @Published var partialText: String = ""
 
     func pushLevel(_ value: Double) {
         var next = levelHistory
@@ -651,30 +761,130 @@ final class BubbleState: ObservableObject {
 
 struct BubbleView: View {
     @EnvironmentObject var state: BubbleState
+    @State private var transcriptArrivalProgress: CGFloat = 0
+
+    private var hasPartial: Bool {
+        !state.partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var transcriptProgress: CGFloat {
+        min(1, max(0, transcriptArrivalProgress))
+    }
+
+    private var fullAudioWidth: CGFloat {
+        max(0, innerContentWidth - BubbleLayout.dotRegionWidth)
+    }
+
+    private var innerContentWidth: CGFloat {
+        BubbleLayout.listeningWidth - BubbleLayout.contentLeadingPadding - BubbleLayout.contentTrailingPadding
+    }
+
+    private var partialTextWidth: CGFloat {
+        max(
+            0,
+            innerContentWidth
+                - BubbleLayout.dotRegionWidth
+                - BubbleLayout.audioStripWidth
+                - BubbleLayout.textToAudioGap
+        )
+    }
+
+    private var stripAudioBarWidth: CGFloat {
+        max(0, BubbleLayout.audioStripWidth - BubbleLayout.audioTrailingPadding)
+    }
+
+    private var animatedAudioLaneWidth: CGFloat {
+        fullAudioWidth - (fullAudioWidth - BubbleLayout.audioStripWidth) * transcriptProgress
+    }
+
+    private var animatedAudioBarWidth: CGFloat {
+        max(0, animatedAudioLaneWidth - BubbleLayout.audioTrailingPadding)
+    }
+
+    private var animatedTextWidth: CGFloat {
+        partialTextWidth * transcriptProgress
+    }
+
+    private var animatedTextGap: CGFloat {
+        BubbleLayout.textToAudioGap * transcriptProgress
+    }
+
+    private var textSlideOffset: CGFloat {
+        (1 - transcriptProgress) * -12
+    }
 
     var body: some View {
         ZStack {
             if state.isListening {
-                HStack(spacing: 8) {
+                HStack(spacing: 0) {
                     Circle()
                         .fill(Color.red)
                         .frame(width: 8, height: 8)
-                    Text("Listening")
-                        .font(.system(size: 12, weight: .medium))
-                    LevelBarGraph(levels: state.levelHistory)
-                        .frame(width: 42, height: 10)
+                        .frame(width: BubbleLayout.dotRegionWidth)
+                    HStack(spacing: 0) {
+                        Text(state.partialText)
+                            .font(.system(size: 14, weight: .bold))
+                            .fixedSize(horizontal: true, vertical: false)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: animatedTextWidth, alignment: .trailing)
+                            .padding(.trailing, animatedTextGap)
+                            .offset(x: textSlideOffset)
+                            .opacity(Double(transcriptProgress))
+                            .clipped()
+                            .mask(
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: .clear, location: 0.0),
+                                        .init(color: .white, location: 0.12),
+                                        .init(color: .white, location: 1.0)
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                        ZStack(alignment: .trailing) {
+                            // Full-width bars that get trimmed from the left as transcript appears.
+                            LevelBarGraph(levels: state.levelHistory, fillWidthWithMoreBars: true)
+                                .frame(width: animatedAudioBarWidth, height: 12)
+                                .opacity(Double(1 - transcriptProgress))
+
+                            // Final right-side strip bars that remain once transcript has arrived.
+                            LevelBarGraph(levels: Array(state.levelHistory.suffix(7)))
+                                .frame(width: stripAudioBarWidth, height: 12)
+                                .opacity(Double(transcriptProgress))
+                        }
+                        .frame(width: animatedAudioLaneWidth, alignment: .trailing)
+                    }
+                    .frame(width: fullAudioWidth, alignment: .trailing)
                 }
-                .padding(.horizontal, 12)
+                .padding(.leading, BubbleLayout.contentLeadingPadding)
+                .padding(.trailing, BubbleLayout.contentTrailingPadding)
             }
         }
-        .frame(width: 160, height: 32)
+        .frame(width: state.isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth, height: BubbleLayout.height)
         .background(
             RoundedRectangle(cornerRadius: state.isListening ? 16 : 3, style: .continuous)
                 .fill(Color.black.opacity(state.isListening ? 0.85 : 0.35))
-                .frame(width: state.isListening ? 160 : 24, height: state.isListening ? 32 : 6)
+                .frame(
+                    width: state.isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth,
+                    height: state.isListening ? BubbleLayout.height : BubbleLayout.idleHeight
+                )
         )
         .animation(.spring(response: 0.2, dampingFraction: 0.9), value: state.isListening)
         .foregroundStyle(.white)
+        .onAppear {
+            transcriptArrivalProgress = hasPartial ? 1 : 0
+        }
+        .onChange(of: hasPartial) { visible in
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) {
+                transcriptArrivalProgress = visible ? 1 : 0
+            }
+        }
+        .onChange(of: state.isListening) { listening in
+            if !listening {
+                transcriptArrivalProgress = 0
+            }
+        }
     }
 }
 
@@ -1236,17 +1446,50 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
 
 struct LevelBarGraph: View {
     let levels: [Double]
+    var spacing: CGFloat = 1.5
+    var preferredBarWidth: CGFloat = 2.5
+    var fillWidthWithMoreBars: Bool = false
 
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(0..<levels.count, id: \.self) { idx in
-                let level = levels[idx]
-                let height = max(2, level * 10)
-                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                    .fill(Color.white.opacity(0.9))
-                    .frame(width: 2, height: height)
-                    .frame(height: 10, alignment: .bottom)
+        GeometryReader { proxy in
+            let sourceLevels = levels.isEmpty ? [0] : levels
+            let fillCount = Int(ceil((proxy.size.width + spacing) / (preferredBarWidth + spacing)))
+            let values = fillWidthWithMoreBars
+                ? densified(sourceLevels, targetCount: max(sourceLevels.count, fillCount))
+                : sourceLevels
+            let count = max(values.count, 1)
+            let totalSpacing = spacing * CGFloat(max(count - 1, 0))
+            let maxFittingWidth = max(1, (proxy.size.width - totalSpacing) / CGFloat(count))
+            let barWidth = min(preferredBarWidth, maxFittingWidth)
+            let minHeight = min(3, proxy.size.height)
+
+            HStack(alignment: .center, spacing: spacing) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, level in
+                    let clamped = min(1, max(0, CGFloat(level)))
+                    let barHeight = minHeight + clamped * (proxy.size.height - minHeight)
+                    RoundedRectangle(cornerRadius: min(1.5, barWidth / 2), style: .continuous)
+                        .fill(Color.white.opacity(0.9))
+                        .frame(width: barWidth, height: barHeight)
+                        .frame(height: proxy.size.height, alignment: .center)
+                }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
+        }
+    }
+
+    private func densified(_ values: [Double], targetCount: Int) -> [Double] {
+        guard targetCount > 0 else { return [] }
+        guard values.count > 1 else { return Array(repeating: values.first ?? 0, count: targetCount) }
+        guard targetCount != values.count else { return values }
+
+        let sourceLast = values.count - 1
+        let targetLast = max(targetCount - 1, 1)
+        return (0..<targetCount).map { idx in
+            let position = Double(idx) * Double(sourceLast) / Double(targetLast)
+            let lower = Int(floor(position))
+            let upper = min(sourceLast, lower + 1)
+            let t = position - Double(lower)
+            return values[lower] * (1 - t) + values[upper] * t
         }
     }
 }
@@ -1263,6 +1506,7 @@ final class TranscriptionRunner: @unchecked Sendable {
     private var persistent: PersistentTranscriber?
     private var streaming = false
     private var pendingCompletion: (@Sendable (String) -> Void)?
+    var onPartialText: (@Sendable (String) -> Void)?
 
     func transcribe(audioURL: URL, completion: @escaping @Sendable (String) -> Void) {
         queue.async {
@@ -1388,6 +1632,10 @@ final class TranscriptionRunner: @unchecked Sendable {
                 self.pendingCompletion = nil
             }
         }
+        persistent?.onPartialText = { [weak self] text in
+            guard let self else { return }
+            self.onPartialText?(text)
+        }
         self.persistent = persistent
         return persistent
     }
@@ -1421,6 +1669,10 @@ final class TranscriptionRunner: @unchecked Sendable {
                 }
                 self.pendingCompletion = nil
             }
+        }
+        persistent?.onPartialText = { [weak self] text in
+            guard let self else { return }
+            self.onPartialText?(text)
         }
         self.persistent = persistent
         return persistent
@@ -1476,6 +1728,7 @@ final class PersistentTranscriber: @unchecked Sendable {
     private var pending: [Job] = []
     private var current: Job?
     var onJobEnd: ((String) -> Void)?
+    var onPartialText: ((String) -> Void)?
     private(set) var isAlive: Bool = false
 
     init?(executableURL: URL, arguments: [String]) {
@@ -1600,13 +1853,20 @@ final class PersistentTranscriber: @unchecked Sendable {
 
         switch event {
         case "segment":
-            guard let finalFlag = obj["final"] as? Bool, finalFlag == true else { return }
             guard let text = obj["text"] as? String else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            if var current = current {
-                current.segments.append(trimmed)
-                self.current = current
+            let isFinal = (obj["final"] as? Bool) == true
+            if isFinal {
+                if var current = current {
+                    current.segments.append(trimmed)
+                    self.current = current
+                }
+            }
+            // Emit partial text (all final segments so far + this latest text).
+            if let current = current {
+                let soFar = isFinal ? current.segments.joined(separator: " ") : (current.segments + [trimmed]).joined(separator: " ")
+                onPartialText?(soFar)
             }
         case "job_end":
             if let current = current {
