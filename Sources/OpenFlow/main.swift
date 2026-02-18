@@ -306,8 +306,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         guard !bubbleState.isListening else { return }
         print("[listen] beginListening")
         bubbleState.partialText = ""
+        bubbleState.isProcessing = false
         showBubble()
-        bubbleState.isListening = true
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.9)) {
+            bubbleState.isListening = true
+        }
         bubbleWindow?.setBubbleSize(isListening: true)
         bubbleWindow?.orderFrontRegardless()
         updateStatusIcon()
@@ -332,8 +335,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             return
         }
         print("[listen] stopListening")
-        bubbleState.isListening = false
-        bubbleState.partialText = ""
+        withAnimation(.easeOut(duration: 0.12)) {
+            bubbleState.isListening = false
+            bubbleState.isProcessing = true
+            bubbleState.partialText = ""
+        }
         bubbleWindow?.setBubbleSize(isListening: false)
         bubbleWindow?.orderFrontRegardless()
         updateStatusIcon()
@@ -347,7 +353,12 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let filtered = suppressSilentFalsePositiveIfNeeded(text)
             let trimmed = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
+            guard !trimmed.isEmpty else {
+                Task { @MainActor in
+                    self.finishProcessingBubble()
+                }
+                return
+            }
             print("[transcription] heard: \(trimmed)")
             let tWhisperDone = Date()
             let tLLMStart = Date()
@@ -357,23 +368,38 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
                 let llmText = refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : refined
                 let finalFiltered = suppressSilentFalsePositiveIfNeeded(llmText)
                 let finalText = finalFiltered.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !finalText.isEmpty else { return }
+                guard !finalText.isEmpty else {
+                    Task { @MainActor in
+                        self.finishProcessingBubble()
+                    }
+                    return
+                }
                 Task { @MainActor in
                     self.historyStore.append(text: finalText)
                     self.refreshHistoryMenu()
-                    guard self.ensureAccessibilityForInsertion() else { return }
-                    AccessibilityPaster.paste(finalText)
-                    let tInserted = Date()
-                    TimingLogger.log(
-                        release: tRelease,
-                        whisperDone: tWhisperDone,
-                        llmStart: tLLMStart,
-                        llmDone: tLLMDone,
-                        inserted: tInserted
-                    )
+                    if self.ensureAccessibilityForInsertion() {
+                        AccessibilityPaster.paste(finalText)
+                        let tInserted = Date()
+                        TimingLogger.log(
+                            release: tRelease,
+                            whisperDone: tWhisperDone,
+                            llmStart: tLLMStart,
+                            llmDone: tLLMDone,
+                            inserted: tInserted
+                        )
+                    }
+                    self.finishProcessingBubble()
                 }
             }
         }
+    }
+
+    private func finishProcessingBubble() {
+        withAnimation(.easeOut(duration: 0.08)) {
+            bubbleState.isProcessing = false
+        }
+        bubbleWindow?.setBubbleSize(isListening: false)
+        bubbleWindow?.orderFrontRegardless()
     }
 
     private func refreshHistoryMenu() {
@@ -716,10 +742,10 @@ final class BubbleWindow: NSPanel {
         setFrameOrigin(origin)
     }
 
-    func setBubbleSize(isListening: Bool) {
+    func setBubbleSize(isListening _: Bool) {
         var frame = self.frame
         frame.size = NSSize(
-            width: isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth,
+            width: BubbleLayout.listeningWidth,
             height: BubbleLayout.height
         )
         setFrame(frame, display: true)
@@ -730,8 +756,10 @@ final class BubbleWindow: NSPanel {
 private enum BubbleLayout {
     static let listeningWidth: CGFloat = 200
     static let idleWidth: CGFloat = 24
+    static let processingWidth: CGFloat = 24
     static let height: CGFloat = 32
     static let idleHeight: CGFloat = 6
+    static let processingHeight: CGFloat = 24
     static let contentLeadingPadding: CGFloat = 6
     static let contentTrailingPadding: CGFloat = 10
     static let dotRegionWidth: CGFloat = 20
@@ -742,6 +770,7 @@ private enum BubbleLayout {
 
 final class BubbleState: ObservableObject {
     @Published var isListening = false
+    @Published var isProcessing = false
     @Published var level: Double = 0
     @Published var levelHistory: [Double] = Array(repeating: 0, count: 12)
     @Published var partialText: String = ""
@@ -762,6 +791,23 @@ final class BubbleState: ObservableObject {
 struct BubbleView: View {
     @EnvironmentObject var state: BubbleState
     @State private var transcriptArrivalProgress: CGFloat = 0
+    @State private var processingPulse = false
+
+    private enum VisualMode {
+        case idle
+        case processing
+        case listening
+    }
+
+    private var mode: VisualMode {
+        if state.isListening {
+            return .listening
+        }
+        if state.isProcessing {
+            return .processing
+        }
+        return .idle
+    }
 
     private var hasPartial: Bool {
         !state.partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -813,76 +859,157 @@ struct BubbleView: View {
         (1 - transcriptProgress) * -12
     }
 
+    private var bubbleBodyWidth: CGFloat {
+        switch mode {
+        case .listening:
+            return BubbleLayout.listeningWidth
+        case .processing:
+            return BubbleLayout.processingWidth
+        case .idle:
+            return BubbleLayout.idleWidth
+        }
+    }
+
+    private var bubbleBodyHeight: CGFloat {
+        switch mode {
+        case .listening:
+            return BubbleLayout.height
+        case .processing:
+            return BubbleLayout.processingHeight
+        case .idle:
+            return BubbleLayout.idleHeight
+        }
+    }
+
+    private var bubbleCornerRadius: CGFloat {
+        switch mode {
+        case .listening:
+            return 16
+        case .processing:
+            return BubbleLayout.processingHeight / 2
+        case .idle:
+            return 3
+        }
+    }
+
+    private var bubbleOpacity: Double {
+        switch mode {
+        case .listening, .processing:
+            return 0.85
+        case .idle:
+            return 0.35
+        }
+    }
+
+    @ViewBuilder
+    private var listeningContent: some View {
+        HStack(spacing: 0) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+                .frame(width: BubbleLayout.dotRegionWidth)
+            HStack(spacing: 0) {
+                Text(state.partialText)
+                    .font(.system(size: 14, weight: .bold))
+                    .fixedSize(horizontal: true, vertical: false)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: animatedTextWidth, alignment: .trailing)
+                    .padding(.trailing, animatedTextGap)
+                    .offset(x: textSlideOffset)
+                    .opacity(Double(transcriptProgress))
+                    .clipped()
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.0),
+                                .init(color: .white, location: 0.12),
+                                .init(color: .white, location: 1.0)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                ZStack(alignment: .trailing) {
+                    // Full-width bars that get trimmed from the left as transcript appears.
+                    LevelBarGraph(levels: state.levelHistory, fillWidthWithMoreBars: true)
+                        .frame(width: animatedAudioBarWidth, height: 12)
+                        .opacity(Double(1 - transcriptProgress))
+
+                    // Final right-side strip bars that remain once transcript has arrived.
+                    LevelBarGraph(levels: Array(state.levelHistory.suffix(7)))
+                        .frame(width: stripAudioBarWidth, height: 12)
+                        .opacity(Double(transcriptProgress))
+                }
+                .frame(width: animatedAudioLaneWidth, alignment: .trailing)
+            }
+            .frame(width: fullAudioWidth, alignment: .trailing)
+        }
+        .padding(.leading, BubbleLayout.contentLeadingPadding)
+        .padding(.trailing, BubbleLayout.contentTrailingPadding)
+    }
+
+    private var processingContent: some View {
+        ZStack {
+            Circle()
+                .stroke(Color(red: 1.0, green: 0.8, blue: 0.0).opacity(0.6), lineWidth: 1.2)
+                .frame(width: 14, height: 14)
+                .scaleEffect(processingPulse ? 1.2 : 0.9)
+                .opacity(processingPulse ? 0.25 : 0.7)
+
+            Circle()
+                .fill(Color(red: 1.0, green: 0.8, blue: 0.0))
+                .frame(width: 8, height: 8)
+                .scaleEffect(processingPulse ? 1.18 : 0.9)
+                .shadow(color: Color(red: 1.0, green: 0.8, blue: 0.0).opacity(0.5), radius: processingPulse ? 4 : 1)
+        }
+    }
+
+    private func startProcessingPulse() {
+        processingPulse = false
+        withAnimation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true)) {
+            processingPulse = true
+        }
+    }
+
     var body: some View {
         ZStack {
-            if state.isListening {
-                HStack(spacing: 0) {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 8, height: 8)
-                        .frame(width: BubbleLayout.dotRegionWidth)
-                    HStack(spacing: 0) {
-                        Text(state.partialText)
-                            .font(.system(size: 14, weight: .bold))
-                            .fixedSize(horizontal: true, vertical: false)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: animatedTextWidth, alignment: .trailing)
-                            .padding(.trailing, animatedTextGap)
-                            .offset(x: textSlideOffset)
-                            .opacity(Double(transcriptProgress))
-                            .clipped()
-                            .mask(
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: .clear, location: 0.0),
-                                        .init(color: .white, location: 0.12),
-                                        .init(color: .white, location: 1.0)
-                                    ],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                        ZStack(alignment: .trailing) {
-                            // Full-width bars that get trimmed from the left as transcript appears.
-                            LevelBarGraph(levels: state.levelHistory, fillWidthWithMoreBars: true)
-                                .frame(width: animatedAudioBarWidth, height: 12)
-                                .opacity(Double(1 - transcriptProgress))
+            RoundedRectangle(cornerRadius: bubbleCornerRadius, style: .continuous)
+                .fill(Color.black.opacity(bubbleOpacity))
+                .frame(width: bubbleBodyWidth, height: bubbleBodyHeight)
 
-                            // Final right-side strip bars that remain once transcript has arrived.
-                            LevelBarGraph(levels: Array(state.levelHistory.suffix(7)))
-                                .frame(width: stripAudioBarWidth, height: 12)
-                                .opacity(Double(transcriptProgress))
-                        }
-                        .frame(width: animatedAudioLaneWidth, alignment: .trailing)
-                    }
-                    .frame(width: fullAudioWidth, alignment: .trailing)
-                }
-                .padding(.leading, BubbleLayout.contentLeadingPadding)
-                .padding(.trailing, BubbleLayout.contentTrailingPadding)
+            switch mode {
+            case .listening:
+                listeningContent
+                    .frame(width: bubbleBodyWidth, height: BubbleLayout.height)
+            case .processing:
+                processingContent
+                    .frame(width: bubbleBodyWidth, height: bubbleBodyHeight)
+            case .idle:
+                EmptyView()
             }
         }
-        .frame(width: state.isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth, height: BubbleLayout.height)
-        .background(
-            RoundedRectangle(cornerRadius: state.isListening ? 16 : 3, style: .continuous)
-                .fill(Color.black.opacity(state.isListening ? 0.85 : 0.35))
-                .frame(
-                    width: state.isListening ? BubbleLayout.listeningWidth : BubbleLayout.idleWidth,
-                    height: state.isListening ? BubbleLayout.height : BubbleLayout.idleHeight
-                )
-        )
-        .animation(.spring(response: 0.2, dampingFraction: 0.9), value: state.isListening)
+        .frame(width: BubbleLayout.listeningWidth, height: BubbleLayout.height, alignment: .center)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .foregroundStyle(.white)
         .onAppear {
             transcriptArrivalProgress = hasPartial ? 1 : 0
+            if mode == .processing {
+                startProcessingPulse()
+            }
         }
         .onChange(of: hasPartial) { visible in
             withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) {
                 transcriptArrivalProgress = visible ? 1 : 0
             }
         }
-        .onChange(of: state.isListening) { listening in
-            if !listening {
+        .onChange(of: mode) { nextMode in
+            if nextMode != .listening {
                 transcriptArrivalProgress = 0
+            }
+            if nextMode == .processing {
+                startProcessingPulse()
+            } else {
+                processingPulse = false
             }
         }
     }
