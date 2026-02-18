@@ -15,6 +15,9 @@ let package = Package(
             path: "Sources/OpenFlow",
             resources: [
                 .process("Resources")
+            ],
+            swiftSettings: [
+                .define("OPENFLOW_DEV", .when(configuration: .debug))
             ]
         )
     ]

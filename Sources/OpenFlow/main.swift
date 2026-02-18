@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 @preconcurrency import AVFoundation
+import AudioToolbox
+import CoreAudio
 
 @MainActor
 final class OpenFlowApp: NSObject, NSApplicationDelegate {
@@ -20,6 +22,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var settingsWindowDelegate: SettingsWindowDelegate?
     private var usesStatusImage = false
     private var didShowMicDeniedAlert = false
+    private var selectedMicUID: String?
+    private var fnPressActive = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -32,9 +36,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        requestAccessibilityIfNeeded()
-
         configStore.load()
+        _ = requestAccessibilityIfNeeded(prompt: configStore.config.didPromptForAccessibility != true)
+        NSApp.setActivationPolicy(.accessory)
+        selectedMicUID = configStore.config.micDeviceUID
+        if selectedMicUID == nil {
+            selectedMicUID = MicrophoneCatalog.defaultBuiltinUID() ?? MicrophoneCatalog.currentDefaultUID()
+        }
+        audioRecorder.setPreferredInputDeviceUID(selectedMicUID)
         transcriptionRunner.dictionaryPath = configStore.config.dictionaryPath
         transcriptionRunner.dictionaryText = configStore.config.dictionaryText
         transcriptionRunner.modelName = configStore.config.model
@@ -92,6 +101,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        let microphoneMenu = NSMenu(title: "Microphone")
+        let microphoneItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        microphoneItem.submenu = microphoneMenu
+        menu.addItem(microphoneItem)
+        rebuildMicrophoneMenu(microphoneMenu)
+
+        menu.addItem(NSMenuItem.separator())
+
         let stylesMenu = NSMenu(title: "Styles")
         let stylesItem = NSMenuItem(title: "Styles", action: nil, keyEquivalent: "")
         stylesItem.submenu = stylesMenu
@@ -145,28 +162,58 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     private func setupHotkey() {
         hotkeyMonitor.onFnDown = { [weak self] in
-            self?.startListening()
+            // Already on main thread (event monitor / timer callback).
+            self?.handleFnDown()
         }
         hotkeyMonitor.onFnUp = { [weak self] in
-            self?.stopListening()
+            self?.handleFnUp()
         }
         hotkeyMonitor.start()
     }
 
+    private func handleFnDown() {
+        print("[hotkey] fn DOWN")
+        fnPressActive = true
+        startListening()
+    }
+
+    private func handleFnUp() {
+        print("[hotkey] fn UP  isListening=\(bubbleState.isListening)")
+        fnPressActive = false
+        stopListening()
+    }
+
     private func startListening() {
         guard !bubbleState.isListening else { return }
-        ensureMicrophoneAccess { [weak self] granted in
-            guard let self else { return }
-            guard granted else {
-                showMicrophonePermissionAlertIfNeeded()
-                return
-            }
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch micStatus {
+        case .authorized:
             beginListening()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                Task { @MainActor [weak self] in
+                    guard let self, self.fnPressActive else { return }
+                    guard granted else {
+                        self.showMicrophonePermissionAlertIfNeeded()
+                        return
+                    }
+                    self.beginListening()
+                }
+            }
+        case .denied, .restricted:
+            showMicrophonePermissionAlertIfNeeded()
+        @unknown default:
+            break
         }
     }
 
     private func beginListening() {
+        guard !bubbleState.isListening else { return }
+        print("[listen] beginListening")
+        showBubble()
         bubbleState.isListening = true
+        bubbleWindow?.setBubbleSize(isListening: true)
+        bubbleWindow?.orderFrontRegardless()
         updateStatusIcon()
         do {
             try transcriptionRunner.startStreaming()
@@ -175,6 +222,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             }
             startLevelMeter()
         } catch {
+            print("[listen] beginListening FAILED: \(error)")
+            fnPressActive = false
             bubbleState.isListening = false
             updateStatusIcon()
             return
@@ -182,8 +231,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     }
 
     private func stopListening() {
-        guard bubbleState.isListening else { return }
+        guard bubbleState.isListening else {
+            print("[listen] stopListening skipped (not listening)")
+            return
+        }
+        print("[listen] stopListening")
         bubbleState.isListening = false
+        bubbleWindow?.setBubbleSize(isListening: false)
+        bubbleWindow?.orderFrontRegardless()
         updateStatusIcon()
         stopLevelMeter()
         audioRecorder.stopStreaming()
@@ -245,6 +300,38 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         let manageItem = NSMenuItem(title: "Manage Styles...", action: #selector(manageStyles), keyEquivalent: "")
         manageItem.target = self
         menu.addItem(manageItem)
+    }
+
+    private func refreshMicrophoneMenu() {
+        if let menu = statusItem?.menu?.item(withTitle: "Microphone")?.submenu {
+            rebuildMicrophoneMenu(menu)
+        }
+    }
+
+    private func rebuildMicrophoneMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let devices = MicrophoneCatalog.available()
+        if devices.isEmpty {
+            let empty = NSMenuItem(title: "No input devices found", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+        for device in devices {
+            let item = NSMenuItem(title: device.name, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = device.uid
+            item.state = (device.uid == selectedMicUID) ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func selectMicrophone(_ sender: NSMenuItem) {
+        guard let uid = sender.representedObject as? String else { return }
+        selectedMicUID = uid
+        audioRecorder.setPreferredInputDeviceUID(uid)
+        configStore.setMicDeviceUID(uid)
+        refreshMicrophoneMenu()
     }
 
     @objc private func selectStyle(_ sender: NSMenuItem) {
@@ -349,6 +436,7 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
             panel.positionBottomCenter()
             bubbleWindow = panel
         }
+        bubbleWindow?.setBubbleSize(isListening: bubbleState.isListening)
         bubbleWindow?.orderFrontRegardless()
     }
 
@@ -412,10 +500,15 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         levelTimer?.invalidate()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in
-                let level = audioRecorder.currentLevel()
-                bubbleState.level = level
-                bubbleState.pushLevel(level)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.bubbleState.isListening && !self.hotkeyMonitor.isFnPressedNow() {
+                    self.handleFnUp()
+                    return
+                }
+                let level = self.audioRecorder.currentLevel()
+                self.bubbleState.level = level
+                self.bubbleState.pushLevel(level)
             }
         }
     }
@@ -427,25 +520,28 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         bubbleState.levelHistory = Array(repeating: 0, count: 12)
     }
 
-    private func requestAccessibilityIfNeeded() {
+    @discardableResult
+    private func requestAccessibilityIfNeeded(prompt: Bool = true) -> Bool {
         if AXIsProcessTrusted() {
-            return
+            return true
         }
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        guard prompt else {
+            return false
+        }
         let key = "AXTrustedCheckOptionPrompt" as CFString
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+        configStore.markAccessibilityPrompted()
+        return false
     }
 
     private func ensureAccessibilityForInsertion() -> Bool {
         if AXIsProcessTrusted() {
             return true
         }
-        requestAccessibilityIfNeeded()
-
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        _ = requestAccessibilityIfNeeded(prompt: configStore.config.didPromptForAccessibility != true)
         let alert = NSAlert()
         alert.messageText = "Accessibility Access Required"
         alert.informativeText = "OpenFlow can transcribe your speech, but macOS must grant Accessibility access to paste into the focused app."
@@ -456,25 +552,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
+        NSApp.setActivationPolicy(.accessory)
         return false
-    }
-
-    private func ensureMicrophoneAccess(_ completion: @escaping (Bool) -> Void) {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
-        switch status {
-        case .authorized:
-            completion(true)
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                DispatchQueue.main.async {
-                    completion(granted)
-                }
-            }
-        case .denied, .restricted:
-            completion(false)
-        @unknown default:
-            completion(false)
-        }
     }
 
     private func showMicrophonePermissionAlertIfNeeded() {
@@ -528,7 +607,9 @@ final class BubbleWindow: NSPanel {
     }
 
     func positionBottomCenter() {
-        guard let screen = NSScreen.main else { return }
+        let mouse = NSEvent.mouseLocation
+        let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+        guard let screen = activeScreen ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let frame = screen.visibleFrame
         let origin = NSPoint(x: frame.midX - (self.frame.width / 2), y: frame.minY + 20)
         setFrameOrigin(origin)
@@ -831,12 +912,140 @@ final class SettingsWindowDelegate: NSObject, NSWindowDelegate {
     }
 }
 
-final class HotkeyMonitor {
+struct MicrophoneOption {
+    let uid: String
+    let name: String
+}
+
+enum MicrophoneCatalog {
+    static func available() -> [MicrophoneOption] {
+        allDeviceIDs()
+            .filter { hasInput(deviceID: $0) }
+            .compactMap { deviceID in
+                guard let uid = uid(forAudioDeviceID: deviceID),
+                      let name = name(forAudioDeviceID: deviceID) else { return nil }
+                return MicrophoneOption(uid: uid, name: name)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    static func defaultBuiltinUID() -> String? {
+        available().first { option in
+            let lower = option.name.lowercased()
+            return lower.contains("built-in") || lower.contains("macbook") || lower.contains("internal")
+        }?.uid
+    }
+
+    static func currentDefaultUID() -> String? {
+        guard let id = defaultInputDeviceID() else { return nil }
+        return uid(forAudioDeviceID: id)
+    }
+
+    static func audioDeviceID(forUID targetUID: String) -> AudioDeviceID? {
+        for deviceID in allDeviceIDs() {
+            if uid(forAudioDeviceID: deviceID) == targetUID {
+                return deviceID
+            }
+        }
+        return nil
+    }
+
+    static func setDefaultInputDevice(forUID uid: String) -> Bool {
+        guard let deviceID = audioDeviceID(forUID: uid) else { return false }
+        return setDefaultInputDevice(deviceID: deviceID)
+    }
+
+    private static func setDefaultInputDevice(deviceID: AudioDeviceID) -> Bool {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableDeviceID = deviceID
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, size, &mutableDeviceID)
+        return status == noErr
+    }
+
+    private static func defaultInputDeviceID() -> AudioDeviceID? {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &size, &deviceID)
+        return status == noErr ? deviceID : nil
+    }
+
+    private static func uid(forAudioDeviceID deviceID: AudioDeviceID) -> String? {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rawValue: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &size, &rawValue)
+        return (status == noErr ? rawValue?.takeUnretainedValue() as String? : nil)
+    }
+
+    private static func name(forAudioDeviceID deviceID: AudioDeviceID) -> String? {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rawValue: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &size, &rawValue)
+        return (status == noErr ? rawValue?.takeUnretainedValue() as String? : nil)
+    }
+
+    private static func hasInput(deviceID: AudioDeviceID) -> Bool {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &size)
+        if status != noErr || size == 0 { return false }
+
+        let bufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(size))
+        defer { bufferList.deallocate() }
+        status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &size, bufferList)
+        if status != noErr { return false }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+        return buffers.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
+    }
+
+    private static func allDeviceIDs() -> [AudioDeviceID] {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        let statusSize = AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize)
+        if statusSize != noErr || dataSize == 0 { return [] }
+
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        var devices = Array(repeating: AudioDeviceID(0), count: count)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &devices)
+        return status == noErr ? devices : []
+    }
+}
+
+final class HotkeyMonitor: @unchecked Sendable {
     var onFnDown: (() -> Void)?
     var onFnUp: (() -> Void)?
 
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    private var watchdogTimer: Timer?
     private var fnIsDown = false
 
     func start() {
@@ -846,6 +1055,13 @@ final class HotkeyMonitor {
         }
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handle(event)
+        }
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+            self?.pollFnState()
+        }
+        if let watchdogTimer {
+            RunLoop.main.add(watchdogTimer, forMode: .common)
         }
     }
 
@@ -858,18 +1074,32 @@ final class HotkeyMonitor {
         }
         globalMonitor = nil
         localMonitor = nil
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        fnIsDown = false
+    }
+
+    func isFnPressedNow() -> Bool {
+        CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(63))
     }
 
     private func handle(_ event: NSEvent) {
         guard event.keyCode == 63 else { return }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let isDown = flags.contains(.function)
+        applyFnState(isDown)
+    }
 
-        if isDown && !fnIsDown {
-            fnIsDown = true
+    private func pollFnState() {
+        applyFnState(isFnPressedNow())
+    }
+
+    private func applyFnState(_ isDown: Bool) {
+        guard isDown != fnIsDown else { return }
+        fnIsDown = isDown
+        if isDown {
             onFnDown?()
-        } else if !isDown && fnIsDown {
-            fnIsDown = false
+        } else {
             onFnUp?()
         }
     }
@@ -882,6 +1112,11 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
     private var onPCM: (([Float]) -> Void)?
     private var lastLevel: Double = 0
     private var isRunning = false
+    private var preferredInputDeviceUID: String?
+
+    func setPreferredInputDeviceUID(_ uid: String?) {
+        preferredInputDeviceUID = uid
+    }
 
     func startStreaming(onPCM: @escaping ([Float]) -> Void) throws {
         if isRunning { return }
@@ -889,6 +1124,10 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
         self.onPCM = onPCM
 
         let input = engine.inputNode
+        if let uid = preferredInputDeviceUID {
+            _ = MicrophoneCatalog.setDefaultInputDevice(forUID: uid)
+            _ = Self.setInputDevice(for: input, deviceUID: uid)
+        }
         let inputFormat = input.outputFormat(forBus: 0)
         converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
@@ -917,6 +1156,9 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
 
         engine.prepare()
         try engine.start()
+        if let uid = preferredInputDeviceUID {
+            _ = Self.setInputDevice(for: input, deviceUID: uid)
+        }
     }
 
     func stopStreaming() {
@@ -943,6 +1185,21 @@ final class StreamingAudioRecorder: NSObject, @unchecked Sendable {
         let db = 20.0 * log10(max(rms, 1e-6))
         let normalized = (db + 60.0) / 60.0
         return min(1.0, max(0.0, normalized))
+    }
+
+    private static func setInputDevice(for inputNode: AVAudioInputNode, deviceUID: String) -> Bool {
+        guard let deviceID = MicrophoneCatalog.audioDeviceID(forUID: deviceUID) else { return false }
+        guard let audioUnit = inputNode.audioUnit else { return false }
+        var mutableDeviceID = deviceID
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &mutableDeviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        return status == noErr
     }
 }
 
@@ -1477,6 +1734,7 @@ struct Config: Codable {
     var apiKey: String?
     var didPromptForApiKey: Bool?
     var didPromptForAccessibility: Bool?
+    var micDeviceUID: String?
     var dictionaryPath: String?
     var dictionaryText: [String]?
     var model: String?
@@ -1523,6 +1781,12 @@ final class ConfigStore {
     func setApiKey(_ key: String) {
         var updated = config
         updated.apiKey = key
+        writeConfig(updated)
+    }
+
+    func setMicDeviceUID(_ uid: String?) {
+        var updated = config
+        updated.micDeviceUID = uid
         writeConfig(updated)
     }
 
@@ -1948,13 +2212,32 @@ enum Paths {
     }
 
     static var transcriberDirURL: URL? {
-        if let bundleResourceURL {
-            let candidate = bundleResourceURL.appendingPathComponent("transcriber", isDirectory: true)
-            if FileManager.default.fileExists(atPath: candidate.path) {
+        #if OPENFLOW_DEV
+        // Development: walk up from the executable to find the repo root (contains Package.swift).
+        let execURL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        var cursor = execURL.deletingLastPathComponent()
+        while cursor.path != "/" {
+            if FileManager.default.fileExists(atPath: cursor.appendingPathComponent("Package.swift").path) {
+                let candidate = cursor.appendingPathComponent("transcriber", isDirectory: true)
+                guard FileManager.default.fileExists(atPath: candidate.path) else {
+                    fatalError("[openflow] transcriber/ not found at \(candidate.path). Run transcriber/scripts/setup_whisper.sh first.")
+                }
                 return candidate
             }
+            cursor = cursor.deletingLastPathComponent()
         }
-        return nil
+        fatalError("[openflow] Could not find repo root (Package.swift) from executable at \(execURL.path).")
+        #else
+        // Release: must be bundled inside the .app Resources.
+        guard let bundleResourceURL else {
+            fatalError("[openflow] Bundle resources not found. The app bundle is corrupted.")
+        }
+        let candidate = bundleResourceURL.appendingPathComponent("transcriber", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            fatalError("[openflow] transcriber/ not found in app bundle at \(candidate.path). Rebuild with build_app.sh.")
+        }
+        return candidate
+        #endif
     }
 
     static var vadTranscriberURL: URL? {
