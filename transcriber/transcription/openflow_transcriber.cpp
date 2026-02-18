@@ -28,7 +28,7 @@
 namespace {
 
 struct vad_params {
-    int32_t n_threads = std::max(1u, std::thread::hardware_concurrency());
+    int32_t n_threads = std::min(2u, std::max(1u, std::thread::hardware_concurrency()));
     int32_t capture_id = -1;
     std::string language = "en";
     std::string model = "models/ggml-base.en.bin";

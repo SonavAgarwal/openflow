@@ -1505,6 +1505,8 @@ final class TranscriptionRunner: @unchecked Sendable {
     var vadStop: Double?
     private var persistent: PersistentTranscriber?
     private var streaming = false
+    private var streamSessionID: Int = 0
+    private var activePartialSessionID: Int?
     private var pendingCompletion: (@Sendable (String) -> Void)?
     var onPartialText: (@Sendable (String) -> Void)?
 
@@ -1529,10 +1531,13 @@ final class TranscriptionRunner: @unchecked Sendable {
 
     func startStreaming() throws {
         queue.async {
+            self.streamSessionID &+= 1
+            let sessionID = self.streamSessionID
             if let persistent = self.ensurePersistentStreaming() {
-                persistent.beginStream()
+                persistent.beginStream(sessionID: sessionID)
             }
             self.streaming = true
+            self.activePartialSessionID = sessionID
         }
     }
 
@@ -1552,6 +1557,7 @@ final class TranscriptionRunner: @unchecked Sendable {
             self.pendingCompletion = completion
             persistent.endStream()
             self.streaming = false
+            self.activePartialSessionID = nil
         }
     }
 
@@ -1573,7 +1579,7 @@ final class TranscriptionRunner: @unchecked Sendable {
         process.executableURL = vadPath
         var args = baseArgs(modelPath: modelPath, sileroPath: sileroPath)
         args += ["--audio-file", audioURL.path]
-        let threadCount = threads ?? max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let threadCount = threads ?? defaultThreadCount()
         args += ["--threads", "\(threadCount)"]
         if let beamSize {
             args += ["--beam-size", "\(beamSize)"]
@@ -1611,7 +1617,7 @@ final class TranscriptionRunner: @unchecked Sendable {
               let sileroPath = Paths.sileroModelURL else {
             return nil
         }
-        let threadCount = threads ?? max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let threadCount = threads ?? defaultThreadCount()
         var args = baseArgs(modelPath: modelPath, sileroPath: sileroPath)
         args += ["--threads", "\(threadCount)"]
         if let beamSize {
@@ -1632,8 +1638,10 @@ final class TranscriptionRunner: @unchecked Sendable {
                 self.pendingCompletion = nil
             }
         }
-        persistent?.onPartialText = { [weak self] text in
+        persistent?.onPartialText = { [weak self] sessionID, text in
             guard let self else { return }
+            guard let sessionID else { return }
+            guard sessionID == self.activePartialSessionID else { return }
             self.onPartialText?(text)
         }
         self.persistent = persistent
@@ -1649,7 +1657,7 @@ final class TranscriptionRunner: @unchecked Sendable {
               let sileroPath = Paths.sileroModelURL else {
             return nil
         }
-        let threadCount = threads ?? max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let threadCount = threads ?? defaultThreadCount()
         var args = baseArgs(modelPath: modelPath, sileroPath: sileroPath)
         args += ["--threads", "\(threadCount)"]
         if let beamSize {
@@ -1670,8 +1678,10 @@ final class TranscriptionRunner: @unchecked Sendable {
                 self.pendingCompletion = nil
             }
         }
-        persistent?.onPartialText = { [weak self] text in
+        persistent?.onPartialText = { [weak self] sessionID, text in
             guard let self else { return }
+            guard let sessionID else { return }
+            guard sessionID == self.activePartialSessionID else { return }
             self.onPartialText?(text)
         }
         self.persistent = persistent
@@ -1683,12 +1693,17 @@ final class TranscriptionRunner: @unchecked Sendable {
             "--silero-vad", sileroPath.path,
             "--model", modelPath.path,
             "--pre-padding-ms", "400",
-            "--post-padding-ms", "300"
+            "--post-padding-ms", "300",
+            "--step", "100"
         ]
         let start = vadStart ?? 0.2
         let stop = vadStop ?? 0.1
         args += ["--start-threshold", "\(start)", "--stop-threshold", "\(stop)"]
         return args
+    }
+
+    private func defaultThreadCount() -> Int {
+        min(2, max(1, ProcessInfo.processInfo.activeProcessorCount))
     }
 
     private static func extractTranscript(from data: Data) -> String {
@@ -1716,6 +1731,7 @@ final class TranscriptionRunner: @unchecked Sendable {
 final class PersistentTranscriber: @unchecked Sendable {
     struct Job {
         let audioPath: String
+        let sessionID: Int?
         var segments: [String]
         let completion: @Sendable (String) -> Void
     }
@@ -1728,7 +1744,7 @@ final class PersistentTranscriber: @unchecked Sendable {
     private var pending: [Job] = []
     private var current: Job?
     var onJobEnd: ((String) -> Void)?
-    var onPartialText: ((String) -> Void)?
+    var onPartialText: ((Int?, String) -> Void)?
     private(set) var isAlive: Bool = false
 
     init?(executableURL: URL, arguments: [String]) {
@@ -1765,7 +1781,7 @@ final class PersistentTranscriber: @unchecked Sendable {
 
     func enqueue(audioPath: String, completion: @escaping @Sendable (String) -> Void) {
         queue.async {
-            let job = Job(audioPath: audioPath, segments: [], completion: completion)
+            let job = Job(audioPath: audioPath, sessionID: nil, segments: [], completion: completion)
             if self.current == nil {
                 self.current = job
                 print("[transcription] job_start: \(audioPath)")
@@ -1776,10 +1792,10 @@ final class PersistentTranscriber: @unchecked Sendable {
         }
     }
 
-    func beginStream() {
+    func beginStream(sessionID: Int) {
         queue.async {
             guard self.current == nil else { return }
-            self.current = Job(audioPath: "<stream>", segments: [], completion: { _ in })
+            self.current = Job(audioPath: "<stream>", sessionID: sessionID, segments: [], completion: { _ in })
             self.sendControl("B")
         }
     }
@@ -1859,14 +1875,20 @@ final class PersistentTranscriber: @unchecked Sendable {
             let isFinal = (obj["final"] as? Bool) == true
             if isFinal {
                 if var current = current {
-                    current.segments.append(trimmed)
+                    if current.audioPath == "<stream>" {
+                        // Stream mode: keep only the latest finalized segment so fn-release
+                        // acts on the current segment, not accumulated historical segments.
+                        current.segments = [trimmed]
+                    } else {
+                        current.segments.append(trimmed)
+                    }
                     self.current = current
                 }
             }
             // Emit partial text (all final segments so far + this latest text).
             if let current = current {
                 let soFar = isFinal ? current.segments.joined(separator: " ") : (current.segments + [trimmed]).joined(separator: " ")
-                onPartialText?(soFar)
+                onPartialText?(current.sessionID, soFar)
             }
         case "job_end":
             if let current = current {
