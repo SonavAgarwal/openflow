@@ -13,6 +13,7 @@ TRANSCRIBER_BUILD_BIN="${TRANSCRIBER_DIR}/build/bin"
 WHISPER_MODELS_DIR="${TRANSCRIBER_DIR}/whisper.cpp/models"
 
 SMALL_MODEL="${WHISPER_MODELS_DIR}/ggml-small.en.bin"
+BASE_MODEL="${WHISPER_MODELS_DIR}/ggml-base.en.bin"
 SILERO_MODEL="${WHISPER_MODELS_DIR}/ggml-silero-v5.1.2.bin"
 
 INFO_PLIST="${CONTENTS_DIR}/Info.plist"
@@ -23,7 +24,10 @@ echo "==> Building Swift app (release)"
 cd "${ROOT_DIR}"
 swift build -c release
 
-if [ ! -x "${TRANSCRIBER_BUILD_BIN}/openflow_transcriber" ]; then
+if [ ! -x "${TRANSCRIBER_BUILD_BIN}/openflow_transcriber" ] || \
+   [ ! -f "${SMALL_MODEL}" ] || \
+   [ ! -f "${BASE_MODEL}" ] || \
+   [ ! -f "${SILERO_MODEL}" ]; then
   echo "==> Building transcriber + VAD"
   cd "${TRANSCRIBER_DIR}"
   ./scripts/setup_whisper.sh
@@ -31,6 +35,11 @@ fi
 
 if [ ! -f "${SMALL_MODEL}" ]; then
   echo "error: missing whisper model at ${SMALL_MODEL}"
+  exit 1
+fi
+
+if [ ! -f "${BASE_MODEL}" ]; then
+  echo "error: missing whisper model at ${BASE_MODEL}"
   exit 1
 fi
 
@@ -101,6 +110,7 @@ mkdir -p "${RESOURCES_DIR}/transcriber/whisper.cpp/models"
 cp "${TRANSCRIBER_BUILD_BIN}/openflow_transcriber" "${RESOURCES_DIR}/transcriber/build/bin/"
 cp "${TRANSCRIBER_BUILD_BIN}/transcriber" "${RESOURCES_DIR}/transcriber/build/bin/"
 cp "${SMALL_MODEL}" "${RESOURCES_DIR}/transcriber/whisper.cpp/models/"
+cp "${BASE_MODEL}" "${RESOURCES_DIR}/transcriber/whisper.cpp/models/"
 cp "${SILERO_MODEL}" "${RESOURCES_DIR}/transcriber/whisper.cpp/models/"
 
 echo "✅ Built ${APP_DIR}"

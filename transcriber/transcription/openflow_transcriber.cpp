@@ -53,6 +53,7 @@ struct vad_params {
     bool debug = false;
     bool stdin_audio = false;
     bool stdin_pcm = false;
+    bool stream_final_full_pass = false;
 
     int32_t step_ms = 200;
     float start_threshold = 0.60f;
@@ -104,6 +105,7 @@ void print_usage(char **argv, const vad_params &p) {
     fprintf(stderr, "  --cpu-only                 disable GPU backends for whisper + VAD\n");
     fprintf(stderr, "  --stdin-audio              read WAV file paths from stdin (one per line) and keep model warm\n");
     fprintf(stderr, "  --stdin-pcm                read float32 PCM from stdin (framed) and keep model warm\n");
+    fprintf(stderr, "  --stream-final-full-pass   keep full stdin-pcm job audio in RAM and emit one final full-pass segment on E\n");
     fprintf(stderr, "  -d, --debug                enable debug logging\n");
 }
 
@@ -182,6 +184,8 @@ bool parse_args(int argc, char **argv, vad_params &p) {
             p.stdin_audio = true;
         } else if (a == "--stdin-pcm") {
             p.stdin_pcm = true;
+        } else if (a == "--stream-final-full-pass") {
+            p.stream_final_full_pass = true;
         } else if (a == "--start-threshold") {
             p.start_threshold = std::clamp(static_cast<float>(atof(need(a.c_str(), i))), 0.0f, 1.0f);
         } else if (a == "--stop-threshold") {
@@ -846,6 +850,7 @@ int main(int argc, char **argv) {
 
     const bool use_stdin_audio = params.stdin_audio;
     const bool use_stdin_pcm = params.stdin_pcm;
+    const bool stream_full_pass_mode = use_stdin_pcm && params.stream_final_full_pass;
     const bool use_mic_capture = params.audio_file.empty() && !use_stdin_audio && !use_stdin_pcm;
     audio_async audio(std::max(params.ring_buffer_ms, params.max_segment_ms + params.post_padding_ms + 2000));
     if (use_mic_capture) {
@@ -936,6 +941,7 @@ int main(int argc, char **argv) {
     std::deque<float> pre_roll;
     std::vector<float> chunk_buffer;
     std::vector<float> current_segment;
+    std::vector<float> full_job_audio;
     double segment_prob_sum = 0.0;
     int segment_prob_count = 0;
     bool in_segment = false;
@@ -955,6 +961,7 @@ int main(int argc, char **argv) {
         pre_roll.clear();
         chunk_buffer.clear();
         current_segment.clear();
+        full_job_audio.clear();
         segment_prob_sum = 0.0;
         segment_prob_count = 0;
         in_segment = false;
@@ -1319,7 +1326,7 @@ int main(int argc, char **argv) {
     // even before the first decode happens.
     reload_dictionary_if_needed(-1, -1, false, true);
 
-    auto flush_segment = [&](bool forced_flush) {
+    auto flush_segment = [&](bool forced_flush, bool mark_final = true) {
         if (!in_segment || current_segment.empty()) {
             current_segment.clear();
             segment_prob_sum = 0.0;
@@ -1362,7 +1369,7 @@ int main(int argc, char **argv) {
         emit_transcription(audio_segment,
                            active_segment_index >= 0 ? active_segment_index : segment_index,
                            segment_start_sample,
-                           true,
+                           mark_final,
                            avg_prob,
                            partial_sequence);
 
@@ -1466,12 +1473,12 @@ int main(int argc, char **argv) {
                     if (params.debug) {
                         fprintf(stderr, "segment %d forced flush (max length)\n", segment_index);
                     }
-                    flush_segment(true);
+                    flush_segment(true, !stream_full_pass_mode);
                 } else if (enough_silence && has_post) {
                     if (params.debug) {
                         fprintf(stderr, "segment %d flush after silence (prob=%.3f)\n", segment_index, prob);
                     }
-                    flush_segment(false);
+                    flush_segment(false, !stream_full_pass_mode);
                 }
             } else {
                 for (float sample : chunk_buffer) {
@@ -1577,7 +1584,22 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (tag == 'E') {
-                flush_segment(true);
+                if (stream_full_pass_mode) {
+                    // Keep UI updates from any pending tail audio, but reserve "final=true" for
+                    // one full-pass decode over the complete held stream.
+                    flush_segment(true, false);
+                    if (!full_job_audio.empty()) {
+                        emit_transcription(full_job_audio,
+                                           0,
+                                           0,
+                                           true,
+                                           0.0,
+                                           0);
+                    }
+                    full_job_audio.clear();
+                } else {
+                    flush_segment(true);
+                }
                 printf("{\"event\":\"job_end\"}\n");
                 fflush(stdout);
                 continue;
@@ -1596,6 +1618,9 @@ int main(int argc, char **argv) {
                 }
                 for (float s : samples) {
                     pending_samples.push_back(s);
+                }
+                if (stream_full_pass_mode) {
+                    full_job_audio.insert(full_job_audio.end(), samples.begin(), samples.end());
                 }
                 process_pending_chunks();
                 continue;

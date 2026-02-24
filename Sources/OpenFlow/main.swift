@@ -99,6 +99,8 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
     private var usesStatusImage = false
     private var didShowMicDeniedAlert = false
     private var selectedMicUID: String?
+    private var selectedModelName = "small"
+    private var needsTranscriberRestart = false
     private var fnPressActive = false
     private var lastFnUpTime: Date?
     private static let fnCooldown: TimeInterval = 0.15
@@ -121,10 +123,11 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         if selectedMicUID == nil {
             selectedMicUID = MicrophoneCatalog.defaultBuiltinUID() ?? MicrophoneCatalog.currentDefaultUID()
         }
+        selectedModelName = normalizedModelName(configStore.config.model)
         audioRecorder.setPreferredInputDeviceUID(selectedMicUID)
         transcriptionRunner.dictionaryPath = configStore.config.dictionaryPath
         transcriptionRunner.dictionaryText = configStore.config.dictionaryText
-        transcriptionRunner.modelName = configStore.config.model
+        transcriptionRunner.modelName = selectedModelName
         transcriptionRunner.threads = configStore.config.threads
         transcriptionRunner.beamSize = configStore.config.beamSize
         transcriptionRunner.vadStart = configStore.config.vadStart
@@ -195,6 +198,14 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         microphoneItem.submenu = microphoneMenu
         menu.addItem(microphoneItem)
         rebuildMicrophoneMenu(microphoneMenu)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let modelMenu = NSMenu(title: "Model")
+        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
+        modelItem.submenu = modelMenu
+        menu.addItem(modelItem)
+        rebuildModelMenu(modelMenu)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -345,12 +356,18 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         updateStatusIcon()
         stopLevelMeter()
         audioRecorder.stopStreaming()
+        let runner = transcriptionRunner
         let refiner = llmRefiner
+        let shouldRestartTranscriber = needsTranscriberRestart
+        needsTranscriberRestart = false
         let tRelease = Date()
 
         let context = AccessibilityContext.capture(maxBefore: 500, maxAfter: 500)
-        transcriptionRunner.stopStreaming { [weak self] text in
+        runner.stopStreaming { [weak self] text in
             guard let self else { return }
+            if shouldRestartTranscriber {
+                runner.shutdown()
+            }
             let filtered = suppressSilentFalsePositiveIfNeeded(text)
             let trimmed = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {
@@ -435,6 +452,12 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func refreshModelMenu() {
+        if let menu = statusItem?.menu?.item(withTitle: "Model")?.submenu {
+            rebuildModelMenu(menu)
+        }
+    }
+
     private func rebuildMicrophoneMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let devices = MicrophoneCatalog.available()
@@ -453,12 +476,40 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func rebuildModelMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for model in ["small", "base"] {
+            let label = model == "small" ? "Small (Default)" : "Base"
+            let item = NSMenuItem(title: label, action: #selector(selectModel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = model
+            item.state = (model == selectedModelName) ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         guard let uid = sender.representedObject as? String else { return }
         selectedMicUID = uid
         audioRecorder.setPreferredInputDeviceUID(uid)
         configStore.setMicDeviceUID(uid)
         refreshMicrophoneMenu()
+    }
+
+    @objc private func selectModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        let normalized = normalizedModelName(model)
+        guard normalized != selectedModelName else { return }
+        selectedModelName = normalized
+        transcriptionRunner.modelName = normalized
+        configStore.setModelName(normalized)
+        refreshModelMenu()
+
+        if bubbleState.isListening {
+            needsTranscriberRestart = true
+        } else {
+            transcriptionRunner.shutdown()
+        }
     }
 
     @objc private func selectStyle(_ sender: NSMenuItem) {
@@ -474,6 +525,15 @@ final class OpenFlowApp: NSObject, NSApplicationDelegate {
 
     @objc private func openSettingsFromMenu() {
         openSettings(tab: .openRouter)
+    }
+
+    private func normalizedModelName(_ name: String?) -> String {
+        switch (name ?? "small").lowercased() {
+        case "base":
+            return "base"
+        default:
+            return "small"
+        }
     }
 
     private func openSettings(tab: SettingsTab) {
@@ -1794,7 +1854,7 @@ final class TranscriptionRunner: @unchecked Sendable {
            FileManager.default.fileExists(atPath: dictionaryURL.path) {
             args += ["--dictionary-file", dictionaryURL.path]
         }
-        args += ["--stdin-pcm"]
+        args += ["--stdin-pcm", "--stream-final-full-pass"]
         let persistent = PersistentTranscriber(executableURL: vadPath, arguments: args)
         persistent?.onJobEnd = { [weak self] text in
             guard let self else { return }
@@ -2002,19 +2062,19 @@ final class PersistentTranscriber: @unchecked Sendable {
             let isFinal = (obj["final"] as? Bool) == true
             if isFinal {
                 if var current = current {
-                    if current.audioPath == "<stream>" {
-                        // Stream mode: keep only the latest finalized segment so fn-release
-                        // acts on the current segment, not accumulated historical segments.
-                        current.segments = [trimmed]
-                    } else {
-                        current.segments.append(trimmed)
-                    }
+                    current.segments.append(trimmed)
                     self.current = current
                 }
             }
-            // Emit partial text (all final segments so far + this latest text).
+            // Stream mode drives a compact rolling UI (latest chunk only), while job_end
+            // still returns all finalized chunks joined together.
             if let current = current {
-                let soFar = isFinal ? current.segments.joined(separator: " ") : (current.segments + [trimmed]).joined(separator: " ")
+                let soFar: String
+                if current.audioPath == "<stream>" {
+                    soFar = trimmed
+                } else {
+                    soFar = isFinal ? current.segments.joined(separator: " ") : (current.segments + [trimmed]).joined(separator: " ")
+                }
                 onPartialText?(current.sessionID, soFar)
             }
         case "job_end":
@@ -2227,6 +2287,12 @@ final class ConfigStore {
     func setMicDeviceUID(_ uid: String?) {
         var updated = config
         updated.micDeviceUID = uid
+        writeConfig(updated)
+    }
+
+    func setModelName(_ model: String) {
+        var updated = config
+        updated.model = model
         writeConfig(updated)
     }
 
